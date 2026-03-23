@@ -7,3 +7,9 @@ temp_*.jpg
 temp_*.png
 invoices/
 processed_images/
+.env
+invoices/
+processed_images/
+temp_*.jpg
+temp_*.png
+*-key.json
