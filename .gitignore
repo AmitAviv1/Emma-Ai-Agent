@@ -13,3 +13,11 @@ processed_images/
 temp_*.jpg
 temp_*.png
 *-key.json
+
+# Project specific
+.env
+invoices/
+processed_images/
+temp_*.jpg
+temp_*.png
+*-key.json
