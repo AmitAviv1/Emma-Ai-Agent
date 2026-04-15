@@ -1,7 +1,29 @@
+# Core agent framework
 langgraph
+langchain-core
 langchain-openai
-python-dotenv
+langchain-anthropic
+
+# Data / validation
 pydantic
-requests
 pandas
 openpyxl
+
+# PDF handling
+pdfplumber
+pymupdf          # provides fitz — no system deps needed
+
+# Image processing
+Pillow
+rembg            # background removal
+
+# Google Sheets
+gspread
+google-auth
+
+# Web / API
+requests
+streamlit
+
+# Environment
+python-dotenv

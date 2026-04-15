@@ -53,6 +53,8 @@ class Product(BaseModel):
 
 class InvoiceExtraction(BaseModel):
     vendor_name: str = Field(description="Supplier name exactly as printed on the invoice header.")
+    invoice_number: str = Field(default="", description="Invoice/document number (מס' חשבונית / מסמך) from the header. Empty string if not found.")
+    invoice_date: str = Field(default="", description="Invoice date in YYYY-MM-DD format, converted from whatever format is printed. Empty string if not found.")
     products: List[Product]
 
 
@@ -111,7 +113,7 @@ def preprocess_image(image_path: str) -> str:
 
 _VISION_SYSTEM = """\
 You are a precise OCR engine for Israeli supplier invoices.
-Your ONLY job is to read numbers and Hebrew text exactly as printed.
+Your job is to extract invoice metadata AND read every product line exactly as printed.
 
 NEVER:
 - Invent, guess, or paraphrase product names
@@ -121,6 +123,7 @@ NEVER:
 - Use the same product name for multiple rows
 
 ALWAYS:
+- Extract the invoice/document number and date from the header
 - Copy each product's Hebrew description verbatim from the תאור פריט column
 - Copy each barcode digit-by-digit from the ברקוד / מס' פריט column
 - Use סה"כ נטו (line total) as cost — NOT נטו ליחידה (unit price)
@@ -128,22 +131,27 @@ ALWAYS:
 """
 
 _VISION_PROMPT = """\
-This is page {page_num} of a Pet Pharm (פט פארם) Israeli supplier invoice.
+This is page {page_num} of an Israeli supplier invoice{vendor_line}.
 
-Column layout (the table is RTL — Hebrew reads right to left):
+From the invoice HEADER, extract:
+- vendor_name: the supplier company name
+- invoice_number: the document/invoice number (מס' חשבונית / מסמך)
+- invoice_date: the invoice date, converted to YYYY-MM-DD format
+
+Column layout of the PRODUCT TABLE (RTL — Hebrew reads right to left):
   RIGHT SIDE of page → LEFT SIDE of page
   מס' (#) | תאור פריט (description) | כמות (qty) | ברוטו ליחידה | %הנחה | נטו ליחידה | סה"כ נטו | ברקוד
 
 The ברקוד (barcode) column is on the FAR LEFT edge of the table.
-These are 13-digit EAN codes. Read every digit carefully.
+These are EAN codes (typically 13 digits). Read every digit carefully.
 
-The סה"כ נטו column is the SECOND from the left — this is the line total (cost).
+The סה"כ נטו column is the SECOND from the left — this is the LINE TOTAL (cost).
 Do NOT use ברוטו ליחידה or נטו ליחידה as cost.
 
 Rules:
 - Each barcode number = one unique product row
 - Multi-line descriptions belong to the row with that barcode
-- Rows 7 and 8 on page 1 may show crossed-out prices with 0.00 — cost=0.0 for those
+- Rows with crossed-out prices showing 0.00 → cost=0.0
 - Extract EVERY row; do not stop early
 - If a barcode matches one in the catalog list below, use that catalog name EXACTLY
 
@@ -158,12 +166,12 @@ def extract_from_image(image_path: str, page_num: int = 1,
     b64 = encode_image(image_path)
     llm = _get_structured_llm(InvoiceExtraction)
 
+    vendor_line = f" from {vendor_hint}" if vendor_hint and vendor_hint != "Unknown" else ""
     prompt = _VISION_PROMPT.format(
         page_num=page_num,
-        expected=f"approximately {expected}" if expected else "all"
+        expected=f"approximately {expected}" if expected else "all",
+        vendor_line=vendor_line,
     )
-    if vendor_hint and vendor_hint != "Unknown":
-        prompt += f"\nVendor already identified: {vendor_hint}"
 
     # Inject known catalog so model can anchor on exact names and barcodes
     prompt += "\n\n" + _catalog_reference_block()
@@ -182,9 +190,11 @@ def extract_from_image(image_path: str, page_num: int = 1,
     result, warnings = validate_extraction(result)
     corrected, corrections = correct_products(result.products)
     return {
-        "products":    [p.model_dump() for p in corrected],
-        "vendor_name": result.vendor_name,
-        "warnings":    warnings + corrections,
+        "products":        [p.model_dump() for p in corrected],
+        "vendor_name":     result.vendor_name,
+        "invoice_number":  result.invoice_number,
+        "invoice_date":    result.invoice_date,
+        "warnings":        warnings + corrections,
     }
 
 
@@ -418,7 +428,7 @@ def run_vision_on_image(image_path: str, page_num: int = 1,
         )
     except Exception as e:
         print(f"❌ [ERROR] Vision failed on {image_path}: {e}")
-        return {"products": [], "vendor_name": vendor_hint or "Unknown", "warnings": [str(e)]}
+        return {"products": [], "vendor_name": vendor_hint or "Unknown", "invoice_number": "", "invoice_date": "", "warnings": [str(e)]}
     finally:
         if preprocessed and os.path.exists(preprocessed):
             os.remove(preprocessed)
@@ -474,12 +484,18 @@ def get_pdf_type_and_content(file_path: str):
 
 _DIGITAL_SYSTEM = """\
 Invoice parsing engine for Hebrew supplier invoices.
-Extract every product line exactly. Never hallucinate. Never skip rows.\
+Extract invoice metadata and every product line exactly. Never hallucinate. Never skip rows.\
 """
 
 _DIGITAL_PROMPT = """\
-Extract all products from this invoice text.
+Extract the following from this invoice text:
 
+HEADER (fill even if partial):
+- vendor_name: supplier company name as printed
+- invoice_number: document/invoice number (מס' חשבונית / מסמך)
+- invoice_date: date in YYYY-MM-DD format
+
+PRODUCTS (one entry per line item):
 - Copy Hebrew product names exactly as they appear.
 - barcode = 8-13 digit code. Copy every digit exactly.
 - cost = line total (סה"כ נטו). Multiply unit × qty only if no line total.
@@ -501,9 +517,11 @@ def extract_from_digital_pdf(text: str) -> dict:
     result, warnings = validate_extraction(result)
     corrected, corrections = correct_products(result.products)
     return {
-        "products":    [p.model_dump() for p in corrected],
-        "vendor_name": result.vendor_name,
-        "warnings":    warnings + corrections,
+        "products":        [p.model_dump() for p in corrected],
+        "vendor_name":     result.vendor_name,
+        "invoice_number":  result.invoice_number,
+        "invoice_date":    result.invoice_date,
+        "warnings":        warnings + corrections,
     }
 
 
@@ -515,20 +533,24 @@ def extract_invoice_data(state: dict) -> dict:
     file_path = state.get("file_path")
     print(f"\n🚀 [LOG] Processing: {os.path.basename(file_path)}")
 
-    ext          = os.path.splitext(file_path)[1].lower()
-    all_products: list = []
-    vendor_name  = "Unknown"
-    all_warnings: list = []
+    ext             = os.path.splitext(file_path)[1].lower()
+    all_products:   list = []
+    vendor_name     = "Unknown"
+    invoice_number  = ""
+    invoice_date    = ""
+    all_warnings:   list = []
 
     try:
         if ext == ".pdf":
             pdf_type, content = get_pdf_type_and_content(file_path)
 
             if pdf_type == "digital":
-                d            = extract_from_digital_pdf(content)
-                all_products = d["products"]
-                vendor_name  = d["vendor_name"]
-                all_warnings = d["warnings"]
+                d              = extract_from_digital_pdf(content)
+                all_products   = d["products"]
+                vendor_name    = d["vendor_name"]
+                invoice_number = d.get("invoice_number", "")
+                invoice_date   = d.get("invoice_date", "")
+                all_warnings   = d["warnings"]
             else:
                 for i, img in enumerate(content):
                     print(f"📄 [LOG] Page {i+1}/{len(content)}...")
@@ -540,24 +562,32 @@ def extract_invoice_data(state: dict) -> dict:
                     all_warnings.extend(d.get("warnings", []))
                     if d.get("vendor_name") and vendor_name == "Unknown":
                         vendor_name = d["vendor_name"]
+                    if not invoice_number:
+                        invoice_number = d.get("invoice_number", "")
+                    if not invoice_date:
+                        invoice_date = d.get("invoice_date", "")
 
                     if os.path.exists(tmp):
                         os.remove(tmp)
 
         else:
-            d            = run_vision_on_image(file_path, page_num=1)
-            all_products = d["products"]
-            vendor_name  = d.get("vendor_name", "Unknown")
-            all_warnings = d.get("warnings", [])
+            d              = run_vision_on_image(file_path, page_num=1)
+            all_products   = d["products"]
+            vendor_name    = d.get("vendor_name", "Unknown")
+            invoice_number = d.get("invoice_number", "")
+            invoice_date   = d.get("invoice_date", "")
+            all_warnings   = d.get("warnings", [])
 
         print(f"✅ [LOG] Extracted {len(all_products)} products from {vendor_name}")
         if all_warnings:
             print(f"⚠️  [LOG] {len(all_warnings)} validation warning(s).")
 
         return {
-            "products":    all_products,
-            "vendor_name": vendor_name,
-            "warnings":    all_warnings,
+            "products":        all_products,
+            "vendor_name":     vendor_name,
+            "invoice_number":  invoice_number,
+            "invoice_date":    invoice_date,
+            "warnings":        all_warnings,
             "status": f"Successfully processed {len(all_products)} items from {vendor_name}",
         }
 
@@ -565,5 +595,6 @@ def extract_invoice_data(state: dict) -> dict:
         print(f"❌ [ERROR] {e}")
         return {
             "products": [], "vendor_name": "Unknown",
+            "invoice_number": "", "invoice_date": "",
             "warnings": [str(e)], "status": "error",
         }

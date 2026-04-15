@@ -4,7 +4,7 @@ from langgraph.graph import StateGraph, END
 from nodes.extract import extract_invoice_data
 from nodes.inventory import check_inventory_status
 from nodes.wolt_api import upload_to_wolt
-from nodes.storage import store_invoice_data
+from storage import store_invoice_data
 
 # 1. Define the data structure that flows through the graph (State)
 class AgentState(TypedDict):
@@ -49,5 +49,3 @@ workflow.add_edge("upload_wolt", END)
 
 # 5. Compile the graph so it can be executed
 app = workflow.compile()
-
-print("Graph defined successfully!")

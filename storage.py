@@ -112,10 +112,14 @@ PRODUCTS_HEADERS = [
 # Import the catalog from extract.py for auto-approval checks
 def _load_catalog() -> set:
     try:
-        from extract import PRODUCT_CATALOG
+        from nodes.extract import PRODUCT_CATALOG
         return set(PRODUCT_CATALOG.keys())
     except ImportError:
-        return set()
+        try:
+            from extract import PRODUCT_CATALOG  # fallback when nodes/ is already in sys.path
+            return set(PRODUCT_CATALOG.keys())
+        except ImportError:
+            return set()
 
 
 def validate_products(products: list, vendor_name: str) -> dict:
@@ -289,10 +293,12 @@ def _update_products_tab(ws, products: list, vendor_name: str):
             ])
             bc_to_row[bc] = {"row_index": None, "data": {}}  # prevent double-insert
 
-    # Batch write updates
+    # Batch write updates — one API call instead of N
     if updates:
-        for cell, val in updates:
-            ws.update_acell(cell, val)
+        ws.batch_update(
+            [{"range": cell, "values": [[val]]} for cell, val in updates],
+            value_input_option="USER_ENTERED",
+        )
         print(f"🔄 [SHEETS] Updated {len(updates)//5} existing products in catalog tab")
 
     # Append new products
