@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import streamlit as st
+import streamlit.components.v1 as components
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -33,6 +34,7 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+    /* Desktop sidebar */
     [data-testid="stSidebar"] { min-width: 220px; max-width: 220px; }
     .block-container { padding-top: 2rem; }
     div[data-testid="metric-container"] { background: #f8f8f8; border-radius: 8px; padding: 1rem; }
@@ -43,6 +45,54 @@ st.markdown("""
                       border-radius:12px; font-size:12px; font-weight:500; }
     .badge-skipped  { background:#f1efe8; color:#5f5e5a; padding:2px 10px;
                       border-radius:12px; font-size:12px; font-weight:500; }
+
+    /* Mobile */
+    @media (max-width: 768px) {
+        [data-testid="stSidebar"] { min-width: unset; max-width: unset; }
+        .block-container { padding: 1rem 0.75rem 2rem; }
+
+        /* Stack all columns vertically */
+        [data-testid="column"] {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+        }
+
+        /* Bigger tap targets for buttons */
+        .stButton > button {
+            min-height: 48px;
+            font-size: 16px;
+            width: 100%;
+        }
+
+        /* Bigger inputs */
+        .stTextInput > div > div > input,
+        .stSelectbox > div > div {
+            font-size: 16px;
+            min-height: 44px;
+        }
+
+        /* File uploader easier to tap */
+        [data-testid="stFileUploader"] {
+            padding: 1rem;
+        }
+
+        /* Metrics stack nicely */
+        div[data-testid="metric-container"] {
+            padding: 0.6rem;
+        }
+
+        /* Images full width */
+        [data-testid="stImage"] img {
+            width: 100% !important;
+        }
+
+        /* Space for fixed bottom nav */
+        .block-container { padding-bottom: 80px !important; }
+
+        /* Hide table header row on very small screens */
+        .product-row { font-size: 14px; }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -52,7 +102,7 @@ st.markdown("""
 # ─────────────────────────────────────────────
 
 for key, default in {
-    "page":            "upload",
+    "page":            "home",
     "products":        [],
     "vendor_name":     "",
     "invoice_number":  "",
@@ -63,9 +113,20 @@ for key, default in {
     "saved":           False,
     "save_result":     "",
     "log_lines":       [],
+    "_wolt_loaded":    False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+# Auto-load Wolt catalog once per session if path is configured
+if not st.session_state._wolt_loaded:
+    try:
+        from wolt_catalog import load_catalog, WOLT_CATALOG_PATH
+        if WOLT_CATALOG_PATH:
+            load_catalog()
+        st.session_state._wolt_loaded = True
+    except Exception:
+        st.session_state._wolt_loaded = True  # don't retry on error
 
 
 # ─────────────────────────────────────────────
@@ -96,6 +157,7 @@ def nav_button(label, page, badge=None):
 with st.sidebar:
     st.markdown("### 🧾 Invoice Agent")
     st.markdown("---")
+    nav_button("⌂  Home", "home")
     nav_button("📤  Upload", "upload")
     pending_count = len([
         b for b, d in st.session_state.decisions.items()
@@ -108,6 +170,9 @@ with st.sidebar:
     )
     nav_button("📋  Results", "results")
     nav_button("📚  Catalog", "catalog")
+    nav_button("🛒  Wolt Catalog", "wolt")
+    nav_button("📦  Wolt Export", "wolt_export")
+    nav_button("🖼️  Image Processor", "image_processor")
     st.markdown("---")
     st.caption("Logs")
     if st.session_state.log_lines:
@@ -125,10 +190,24 @@ def add_log(msg: str):
 
 def run_extraction(pdf_path: str):
     """Runs the extraction pipeline and populates session state."""
-    from extract import extract_invoice_data
-    from storage import validate_products
-
     add_log(f"Starting extraction: {os.path.basename(pdf_path)}")
+
+    # Import here so errors surface clearly in the UI
+    try:
+        from nodes.extract import extract_invoice_data
+    except ImportError:
+        try:
+            from extract import extract_invoice_data
+        except ImportError as e:
+            raise ImportError(f"Cannot import extract module: {e}. Make sure extract.py is in nodes/ or the project root.")
+
+    try:
+        from nodes.storage import validate_products
+    except ImportError:
+        try:
+            from storage import validate_products
+        except ImportError as e:
+            raise ImportError(f"Cannot import storage module: {e}.")
 
     with st.spinner("Extracting invoice data…"):
         result = extract_invoice_data({"file_path": pdf_path})
@@ -152,13 +231,18 @@ def run_extraction(pdf_path: str):
     st.session_state.saved          = False
     st.session_state.save_result    = ""
 
-    # Initialise decisions: catalog items auto-approved, unknowns pending
+    # Initialise decisions keyed by global product index (barcodes can repeat or be empty)
     decisions = {}
-    for p in validation["approved"]:
-        decisions[p["barcode"]] = {"decision": "approve", "name": p["name"]}
-    for p in validation["pending_review"]:
-        decisions[p["barcode"]] = {"decision": "pending", "name": p["name"]}
+    for i, p in enumerate(validation["approved"]):
+        decisions[i] = {"decision": "approve", "name": p["name"], "barcode": p.get("barcode", "")}
+    offset = len(validation["approved"])
+    pending_with_idx = []
+    for i, p in enumerate(validation["pending_review"]):
+        idx = offset + i
+        decisions[idx] = {"decision": "pending", "name": p["name"], "barcode": p.get("barcode", "")}
+        pending_with_idx.append({**p, "_idx": idx})   # attach index to each pending item
     st.session_state.decisions = decisions
+    st.session_state.pending   = pending_with_idx     # pending now carries its own index
 
     add_log(f"Auto-approved {len(validation['approved'])}, pending review: {len(validation['pending_review'])}")
 
@@ -177,22 +261,21 @@ def save_to_sheets():
     if not sheet_id:
         return "❌ GOOGLE_SHEET_ID not set in .env"
 
-    decisions   = st.session_state.decisions
-    vendor_name = st.session_state.vendor_name
+    decisions    = st.session_state.decisions
+    vendor_name  = st.session_state.vendor_name
     all_products = st.session_state.products
 
     # Build final approved list respecting UI decisions + name edits
     approved      = []
     newly_learned = []
+    pending_barcodes = {p["barcode"] for p in st.session_state.pending}
 
-    for p in all_products:
-        bc  = p.get("barcode", "")
-        dec = decisions.get(bc, {})
+    for i, p in enumerate(all_products):
+        dec = decisions.get(i, {})
         if dec.get("decision") == "approve":
             edited_name = dec.get("name", p["name"])
             approved.append({**p, "name": edited_name, "status": "approved"})
-            # Track products that were unknown (pending) and manually approved
-            if p in st.session_state.pending:
+            if p.get("barcode") in pending_barcodes:
                 newly_learned.append({**p, "name": edited_name})
 
     if not approved:
@@ -238,7 +321,7 @@ def page_upload():
 
     uploaded = st.file_uploader(
         "Drop a PDF invoice or image here",
-        type=["pdf", "jpg", "jpeg", "png"],
+        type=["pdf", "jpg", "jpeg", "png", "webp"],
         label_visibility="collapsed",
     )
 
@@ -252,17 +335,29 @@ def page_upload():
         col1, col2 = st.columns([3, 1])
         with col1:
             st.info(f"**{uploaded.name}** — {uploaded.size // 1024} KB")
-            if ext in ("jpg", "jpeg", "png"):
+            if ext in ("jpg", "jpeg", "png", "webp"):
                 st.image(uploaded, width=400)
         with col2:
             if st.button("Process invoice", type="primary", use_container_width=True):
-                run_extraction(tmp_path)
-                os.unlink(tmp_path)
-                if st.session_state.pending:
-                    st.session_state.page = "review"
-                else:
-                    st.session_state.page = "results"
-                st.rerun()
+                try:
+                    run_extraction(tmp_path)
+                except Exception as e:
+                    st.error(f"Extraction failed: {e}")
+                    add_log(f"❌ Extraction error: {e}")
+                    import traceback
+                    add_log(traceback.format_exc())
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+
+                if st.session_state.products:
+                    if st.session_state.pending:
+                        st.session_state.page = "review"
+                    else:
+                        st.session_state.page = "results"
+                    st.rerun()
+                elif not st.session_state.get("_extract_error"):
+                    st.warning("No products were extracted. Check the logs in the sidebar.")
 
     # Show last extraction summary if available
     if st.session_state.products:
@@ -285,8 +380,13 @@ def page_review():
 
     pending = st.session_state.pending
     if not pending:
-        st.success("No unknown products — all items were auto-approved from the catalog.")
-        if st.button("Go to results →"):
+        st.markdown("""
+        <div style="text-align:center;padding:3rem 1rem">
+            <div style="font-size:3.5rem">✅</div>
+            <p style="font-size:1.1rem;font-weight:600;color:#444;margin:0.5rem 0">All products recognized</p>
+            <p style="color:#999;font-size:0.9rem">Every item was auto-approved from your catalog.</p>
+        </div>""", unsafe_allow_html=True)
+        if st.button("Go to results →", type="primary", use_container_width=True):
             st.session_state.page = "results"
             st.rerun()
         return
@@ -307,15 +407,16 @@ def page_review():
     decisions = st.session_state.decisions
 
     for p in pending:
-        bc  = p["barcode"]
-        dec = decisions.get(bc, {"decision": "pending", "name": p["name"]})
+        bc  = p.get("barcode", "")
+        idx = p["_idx"]   # guaranteed unique — set during extraction
+        dec = decisions.get(idx, {"decision": "pending", "name": p["name"], "barcode": bc})
 
         with st.container():
             col_info, col_name, col_action = st.columns([2, 3, 2])
 
             with col_info:
-                st.markdown(f"**Barcode**")
-                st.code(bc, language=None)
+                st.markdown("**Barcode**")
+                st.code(bc if bc else "—", language=None)
                 st.caption(f"Qty: {p['quantity']}  |  Cost: ₪{p['cost']:.2f}")
 
             with col_name:
@@ -323,10 +424,10 @@ def page_review():
                 edited = st.text_input(
                     "name",
                     value=dec.get("name", p["name"]),
-                    key=f"name_{bc}",
+                    key=f"name_{idx}",
                     label_visibility="collapsed",
                 )
-                decisions[bc] = {**dec, "name": edited}
+                decisions[idx] = {**dec, "name": edited}
 
             with col_action:
                 st.markdown("**Decision**")
@@ -335,11 +436,11 @@ def page_review():
                     "decision",
                     ["approve", "skip"],
                     index=0 if current == "approve" else 1,
-                    key=f"dec_{bc}",
+                    key=f"dec_{idx}",
                     horizontal=True,
                     label_visibility="collapsed",
                 )
-                decisions[bc] = {**decisions[bc], "decision": choice}
+                decisions[idx] = {**decisions[idx], "decision": choice}
 
         st.markdown('<hr style="margin:4px 0;opacity:0.2">', unsafe_allow_html=True)
 
@@ -350,8 +451,7 @@ def page_review():
     skipped_count  = sum(1 for d in decisions.values() if d.get("decision") == "skip")
     pending_count  = sum(1 for d in decisions.values() if d.get("decision") == "pending")
 
-    st.caption(f"Approved: {approved_count + len(st.session_state.approved)}  |  "
-               f"Skipped: {skipped_count}  |  Still pending: {pending_count}")
+    st.caption(f"Approved: {approved_count}  |  Skipped: {skipped_count}  |  Still pending: {pending_count}")
 
     col_save, col_skip = st.columns([2, 1])
     with col_save:
@@ -364,10 +464,9 @@ def page_review():
             st.rerun()
     with col_skip:
         if st.button("Save only auto-approved", use_container_width=True):
-            # Mark all pending as skip before saving
-            for bc, d in decisions.items():
+            for idx, d in decisions.items():
                 if d.get("decision") == "pending":
-                    decisions[bc] = {**d, "decision": "skip"}
+                    decisions[idx] = {**d, "decision": "skip"}
             st.session_state.decisions = decisions
             with st.spinner("Saving…"):
                 result = save_to_sheets()
@@ -388,7 +487,15 @@ def page_results():
 
     products = st.session_state.products
     if not products:
-        st.info("No results yet — upload an invoice first.")
+        st.markdown("""
+        <div style="text-align:center;padding:3rem 1rem">
+            <div style="font-size:3.5rem">📋</div>
+            <p style="font-size:1.1rem;font-weight:600;color:#444;margin:0.5rem 0">No results yet</p>
+            <p style="color:#999;font-size:0.9rem">Upload an invoice to see extracted products here.</p>
+        </div>""", unsafe_allow_html=True)
+        if st.button("Go to Upload →", type="primary", use_container_width=True):
+            st.session_state.page = "upload"
+            st.rerun()
         return
 
     decisions   = st.session_state.decisions
@@ -401,6 +508,11 @@ def page_results():
     c2.metric("Products",     len(products))
     c3.metric("Invoice total", f"₪{total_cost:,.2f}")
     c4.metric("Saved",        "Yes ✓" if st.session_state.saved else "Not yet")
+
+    inv_num  = st.session_state.get("invoice_number", "")
+    inv_date = st.session_state.get("invoice_date", "")
+    if inv_num or inv_date:
+        st.caption(f"Invoice: **{inv_num}**   Date: **{inv_date}**")
 
     if st.session_state.save_result:
         if "✅" in st.session_state.save_result:
@@ -419,17 +531,25 @@ def page_results():
         show = st.selectbox("Show", ["All", "Approved", "Pending", "Skipped"],
                             label_visibility="collapsed")
 
+    # Check if any product has Wolt enrichment
+    has_wolt = any(p.get("wolt_price") for p in products)
+
     # Table header
-    hcols = st.columns([3, 2, 1, 1, 1])
-    for col, label in zip(hcols, ["Product", "Barcode", "Qty", "Cost", "Status"]):
-        col.markdown(f"**{label}**")
+    if has_wolt:
+        hcols = st.columns([3, 2, 1, 1, 1, 1])
+        for col, label in zip(hcols, ["Product", "Barcode", "Qty", "Cost", "Sell", "Margin"]):
+            col.markdown(f"**{label}**")
+    else:
+        hcols = st.columns([3, 2, 1, 1, 1])
+        for col, label in zip(hcols, ["Product", "Barcode", "Qty", "Cost", "Status"]):
+            col.markdown(f"**{label}**")
     st.markdown('<hr style="margin:4px 0">', unsafe_allow_html=True)
 
     shown = 0
-    for p in products:
+    for i, p in enumerate(products):
         bc     = p.get("barcode", "")
         name   = p.get("name", "")
-        dec    = decisions.get(bc, {}).get("decision", "approve")
+        dec    = decisions.get(i, {}).get("decision", "approve")
         status = dec
 
         if search and search.lower() not in name.lower() and search not in bc:
@@ -447,12 +567,28 @@ def page_results():
             "skip":    '<span class="badge-skipped">Skipped</span>',
         }.get(status, "")
 
-        row = st.columns([3, 2, 1, 1, 1])
-        row[0].write(name[:60] + ("…" if len(name) > 60 else ""))
-        row[1].code(bc, language=None)
-        row[2].write(p.get("quantity", ""))
-        row[3].write(f"₪{p.get('cost', 0):.2f}")
-        row[4].markdown(badge_html, unsafe_allow_html=True)
+        if has_wolt:
+            row = st.columns([3, 2, 1, 1, 1, 1])
+            row[0].write(name[:55] + ("…" if len(name) > 55 else ""))
+            row[1].code(bc, language=None)
+            row[2].write(p.get("quantity", ""))
+            row[3].write(f"₪{p.get('cost', 0):.2f}")
+            sell = p.get("wolt_price")
+            row[4].write(f"₪{sell:.0f}" if sell else "—")
+            margin = p.get("margin_pct")
+            if margin is not None:
+                color = "green" if margin >= 30 else "orange" if margin >= 15 else "red"
+                row[5].markdown(f"<span style='color:{color};font-weight:500'>{margin:.0f}%</span>",
+                                unsafe_allow_html=True)
+            else:
+                row[5].write("—")
+        else:
+            row = st.columns([3, 2, 1, 1, 1])
+            row[0].write(name[:60] + ("…" if len(name) > 60 else ""))
+            row[1].code(bc, language=None)
+            row[2].write(p.get("quantity", ""))
+            row[3].write(f"₪{p.get('cost', 0):.2f}")
+            row[4].markdown(badge_html, unsafe_allow_html=True)
         shown += 1
 
     if shown == 0:
@@ -516,14 +652,556 @@ def page_catalog():
 
 
 # ─────────────────────────────────────────────
+#  PAGE: WOLT CATALOG
+# ─────────────────────────────────────────────
+
+def page_wolt():
+    st.title("Wolt catalog")
+    st.caption("Upload your Wolt product export to enable sell price and margin matching.")
+
+    # ── Upload section ──────────────────────────────────────────────────
+    try:
+        from wolt_catalog import is_loaded, load_catalog_from_bytes, reload_catalog, _catalog, FUZZY_THRESHOLD
+        loaded = is_loaded()
+    except ImportError:
+        st.error("wolt_catalog.py not found — make sure it's in your nodes/ folder.")
+        return
+
+    if loaded:
+        from wolt_catalog import _catalog, _barcode_index, _sku_index
+        st.success(f"✅ Catalog loaded — {len(_catalog)} products "
+                   f"({len(_barcode_index)} with barcode, {len(_sku_index)} with SKU)")
+        if st.button("🔄 Reload from file"):
+            reload_catalog()
+            st.rerun()
+    else:
+        st.info("No catalog loaded yet. Upload your Wolt Excel export below.")
+
+    st.markdown("---")
+
+    # File uploader
+    uploaded = st.file_uploader(
+        "Upload Wolt catalog (.xlsx)",
+        type=["xlsx"],
+        label_visibility="collapsed",
+    )
+    if uploaded:
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.info(f"**{uploaded.name}** — {uploaded.size // 1024} KB, {0} products")
+        with col2:
+            if st.button("Load catalog", type="primary", use_container_width=True):
+                with st.spinner("Loading…"):
+                    ok = load_catalog_from_bytes(uploaded.read(), uploaded.name)
+                if ok:
+                    st.success("Catalog loaded!")
+                    st.rerun()
+                else:
+                    st.error("Failed to load — make sure it's a valid Wolt export with an 'offers' sheet.")
+
+    st.markdown("---")
+
+    # ── How matching works ───────────────────────────────────────────────
+    with st.expander("How matching works"):
+        st.markdown(f"""
+**Priority order when an invoice product is extracted:**
+
+1. **Exact barcode match** — fastest and most accurate
+2. **Exact SKU match** — uses the `merchant_sku` column from your Wolt export
+3. **Fuzzy name match** — compares Hebrew product names with {int(FUZZY_THRESHOLD*100)}%+ similarity threshold
+
+**After matching**, each product gets:
+- `wolt_price` — your sell price on Wolt
+- `margin_pct` — `(sell - unit_cost) / sell × 100`
+- `match_method` — how it was matched (`barcode`, `sku`, `name_fuzzy`, or `none`)
+
+**To improve matching:**
+- Add barcodes to your Wolt products (edit in Wolt dashboard → Product → GTIN field)
+- The more barcodes you add, the fewer name-fuzzy matches you'll need
+
+**To update the catalog:**
+- Download a fresh export from Wolt dashboard → Catalog → Export
+- Upload it here — replaces the old one
+        """)
+
+    # ── Browse catalog ───────────────────────────────────────────────────
+    if loaded:
+        st.subheader("Browse catalog")
+        from wolt_catalog import _catalog as cat
+        search = st.text_input("Search by name, barcode, or SKU",
+                               label_visibility="collapsed",
+                               placeholder="Search…")
+
+        shown = 0
+        hcols = st.columns([4, 2, 1, 1, 1])
+        for col, label in zip(hcols, ["Name", "Barcode / SKU", "Price", "Enabled", "Match"]):
+            col.markdown(f"**{label}**")
+        st.markdown('<hr style="margin:4px 0">', unsafe_allow_html=True)
+
+        for p in cat:
+            if search:
+                s = search.lower()
+                if s not in p.name.lower() and s not in p.barcode and s not in p.merchant_sku:
+                    continue
+            row = st.columns([4, 2, 1, 1, 1])
+            row[0].write(p.name[:55] + ("…" if len(p.name) > 55 else ""))
+            id_str = p.barcode or p.merchant_sku or "—"
+            row[1].code(id_str[:18], language=None)
+            row[2].write(f"₪{p.sell_price:.0f}")
+            row[3].write("✓" if p.enabled else "✗")
+            method = "bc" if p.barcode else ("sku" if p.merchant_sku else "name")
+            row[4].write(method)
+            shown += 1
+            if shown >= 200:
+                st.caption("Showing first 200 results — refine your search to see more.")
+                break
+
+
+# ─────────────────────────────────────────────
+#  PAGE: IMAGE PROCESSOR
+# ─────────────────────────────────────────────
+
+def page_image_processor():
+    st.title("Image Processor")
+    st.caption("Upload a product image to get a 1000×1000 and 1000×563 PNG with background removed.")
+
+    uploaded = st.file_uploader(
+        "Upload product image",
+        type=["jpg", "jpeg", "png", "webp"],
+        label_visibility="collapsed",
+    )
+
+    # Auto-suggest name from filename; clear old results when a new file is uploaded
+    if uploaded:
+        if st.session_state.get("_imgproc_file") != uploaded.name:
+            st.session_state["_imgproc_file"] = uploaded.name
+            suggested = uploaded.name.rsplit(".", 1)[0].replace("_", " ").replace("-", " ").strip()
+            st.session_state["_imgproc_name"] = suggested
+            st.session_state["_imgproc_results"] = []
+
+    product_name = st.text_input(
+        "Product name",
+        key="_imgproc_name",
+        placeholder="e.g. Vitamin C 500mg",
+    )
+
+    skip_rembg = st.checkbox("Background already removed — skip background removal", value=False)
+
+    if uploaded and product_name:
+        st.image(uploaded, caption="Original", width=260)
+
+        if st.button("Process image", type="primary", use_container_width=True):
+            import io as _io
+            from rembg import remove
+            from PIL import Image
+            from tools.image_utils.processor import create_formatted_image, sanitize_filename
+            import numpy as np
+
+            raw = uploaded.getvalue()
+            safe_name = sanitize_filename(product_name)
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_images")
+            os.makedirs(output_dir, exist_ok=True)
+            results = []
+
+            with st.status("Processing image…", expanded=True) as status:
+                img = Image.open(_io.BytesIO(raw)).convert("RGBA")
+                arr = np.array(img)
+
+                # Detect if background is already transparent
+                total_px = arr.shape[0] * arr.shape[1]
+                already_transparent = np.sum(arr[:, :, 3] == 0) / total_px > 0.10
+
+                if skip_rembg or already_transparent:
+                    st.write("⏭️ Skipping background removal…")
+                else:
+                    st.write("🔧 Removing background…")
+                    arr = np.array(Image.open(_io.BytesIO(remove(raw))).convert("RGBA"))
+
+                # Clean up stray near-transparent pixels
+                arr[arr[:, :, 3] < 20, 3] = 0
+                img = Image.fromarray(arr)
+
+                bbox = img.getbbox()
+                if not bbox:
+                    status.update(label="No product detected", state="error")
+                    st.error("No product detected. Try a clearer photo.")
+                else:
+                    cropped = img.crop(bbox)
+                    variants = [
+                        ((1000, 1000), "1000×1000", f"{safe_name}.png"),
+                        ((1000, 563),  "1000×563",  f"wolt{safe_name}.png"),
+                    ]
+                    for size, tag, fname in variants:
+                        st.write(f"📐 Creating {tag}…")
+                        out = create_formatted_image(cropped, size)
+                        path = os.path.join(output_dir, fname)
+                        out.save(path, "PNG")
+                        buf = _io.BytesIO()
+                        out.save(buf, "PNG")
+                        results.append((buf.getvalue(), fname, tag))
+                    status.update(label="Done!", state="complete", expanded=False)
+
+            # Store bytes in session state so downloads don't re-trigger processing
+            st.session_state["_imgproc_results"] = results
+
+    elif not uploaded:
+        st.markdown("""
+        <div style="text-align:center;padding:3rem 1rem">
+            <p style="font-size:1.1rem;font-weight:600;color:#444;margin:0.5rem 0">No image yet</p>
+            <p style="color:#999;font-size:0.9rem">Drop a product photo above to get started.</p>
+        </div>""", unsafe_allow_html=True)
+
+    # Results — rendered outside the button block so they survive reruns from download clicks
+    results = st.session_state.get("_imgproc_results", [])
+    if results:
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        for col, (data, fname, tag) in zip([col1, col2], results):
+            with col:
+                st.image(data, caption=tag, use_container_width=True)
+                st.download_button(
+                    "Download",
+                    data=data,
+                    file_name=fname,
+                    mime="image/png",
+                    use_container_width=True,
+                    key=f"dl_{tag}",
+                )
+
+
+# ─────────────────────────────────────────────
+#  PAGE: HOME
+# ─────────────────────────────────────────────
+
+def page_home():
+    st.markdown("## Invoice Agent")
+    st.caption("AI-powered invoice processing and product image automation.")
+    st.markdown("---")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("""
+        <div style="border:1px solid #e0e0e0;border-radius:12px;padding:1.5rem 1rem;text-align:center;min-height:130px">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="1.6"
+                 stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:8px">
+                <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+                <line x1="12" y1="18" x2="12" y2="12"/>
+                <line x1="9" y1="15" x2="15" y2="15"/>
+            </svg>
+            <p style="font-weight:600;margin:0 0 4px">Upload Invoice</p>
+            <p style="font-size:0.8rem;color:#999;margin:0">Extract products from PDF or image invoices</p>
+        </div>""", unsafe_allow_html=True)
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if st.button("Open", key="home_upload", use_container_width=True, type="primary"):
+            st.session_state.page = "upload"
+            st.rerun()
+
+    with col2:
+        st.markdown("""
+        <div style="border:1px solid #e0e0e0;border-radius:12px;padding:1.5rem 1rem;text-align:center;min-height:130px">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="1.6"
+                 stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:8px">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                <circle cx="8.5" cy="8.5" r="1.5"/>
+                <polyline points="21 15 16 10 5 21"/>
+            </svg>
+            <p style="font-weight:600;margin:0 0 4px">Process Image</p>
+            <p style="font-size:0.8rem;color:#999;margin:0">Remove backgrounds & create catalog images</p>
+        </div>""", unsafe_allow_html=True)
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if st.button("Open", key="home_images", use_container_width=True):
+            st.session_state.page = "image_processor"
+            st.rerun()
+
+    if st.session_state.products:
+        st.markdown("---")
+        st.caption("Current session")
+        c1, c2, c3, c4 = st.columns(4)
+        total_cost = sum(p.get("cost", 0) for p in st.session_state.approved)
+        c1.metric("Supplier",  st.session_state.vendor_name or "—")
+        c2.metric("Products",  len(st.session_state.products))
+        c3.metric("Pending",   len(st.session_state.pending))
+        c4.metric("Total",     f"₪{total_cost:,.0f}")
+        if st.button("View results →", use_container_width=True):
+            st.session_state.page = "results"
+            st.rerun()
+
+
+# ─────────────────────────────────────────────
+#  PAGE: WOLT EXPORT
+# ─────────────────────────────────────────────
+
+def page_wolt_export():
+    import pandas as pd
+    import zipfile
+    import io as _io
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill
+
+    st.title("Wolt Export")
+    st.caption("Build the Wolt product Excel, bundle catalog images, and submit via Monday.")
+
+    # ── Section 1: Product table ──────────────────────────────────────────
+    st.subheader("Product table")
+
+    HEBREW_HEADERS = ["שם פריט", "מק״ט", "תיאור פריט", "מחיר פריט",
+                      "משקל פריט", "נפח פריט", "אחוזי אלכוהול", "הערות"]
+    COL_KEYS       = ["שם פריט", "מק״ט", "תיאור פריט", "מחיר פריט",
+                      "משקל פריט", "נפח פריט", "אחוזי אלכוהול", "הערות"]
+
+    # Pre-populate from session if available
+    products = st.session_state.get("products", [])
+    decisions = st.session_state.get("decisions", {})
+    approved_products = [
+        p for i, p in enumerate(products)
+        if decisions.get(i, {}).get("decision", "approve") == "approve"
+    ]
+
+    if approved_products:
+        st.caption(f"Pre-filled from current session ({len(approved_products)} approved products). Edit any cell before exporting.")
+        rows = []
+        for p in approved_products:
+            rows.append({
+                "שם פריט":       p.get("name", ""),
+                "מק״ט":          p.get("sku") or p.get("wolt_sku") or "",
+                "תיאור פריט":    "",
+                "מחיר פריט":     p.get("wolt_price") or None,
+                "משקל פריט":     None,
+                "נפח פריט":      None,
+                "אחוזי אלכוהול": 0,
+                "הערות":         "",
+            })
+        df = pd.DataFrame(rows, columns=COL_KEYS)
+    else:
+        st.caption("No invoice loaded. Fill in the table manually or upload an invoice first.")
+        df = pd.DataFrame(
+            [{"שם פריט": "", "מק״ט": "", "תיאור פריט": "", "מחיר פריט": None,
+              "משקל פריט": None, "נפח פריט": None, "אחוזי אלכוהול": 0, "הערות": ""}],
+            columns=COL_KEYS,
+        )
+
+    edited_df = st.data_editor(
+        df,
+        use_container_width=True,
+        num_rows="dynamic",
+        column_config={
+            "שם פריט":       st.column_config.TextColumn("שם פריט", width="large"),
+            "מק״ט":          st.column_config.TextColumn("מק״ט", width="small"),
+            "תיאור פריט":    st.column_config.TextColumn("תיאור פריט", width="medium"),
+            "מחיר פריט":     st.column_config.NumberColumn("מחיר פריט ₪", format="%.2f"),
+            "משקל פריט":     st.column_config.NumberColumn("משקל (ג׳)", format="%.0f"),
+            "נפח פריט":      st.column_config.NumberColumn("נפח (מ״ל)", format="%.0f"),
+            "אחוזי אלכוהול": st.column_config.NumberColumn("אלכוהול %", format="%.1f"),
+            "הערות":         st.column_config.TextColumn("הערות"),
+        },
+        key="wolt_export_table",
+    )
+
+    # ── Section 2: Generate Excel ─────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Download Excel")
+
+    if st.button("Generate Excel", type="primary", use_container_width=True):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Products"
+        ws.sheet_view.rightToLeft = True
+
+        header_fill = PatternFill("solid", fgColor="1F4E79")
+        header_font = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+        header_align = Alignment(horizontal="center", vertical="center")
+
+        for col_idx, header in enumerate(HEBREW_HEADERS, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.fill   = header_fill
+            cell.font   = header_font
+            cell.alignment = header_align
+
+        ws.row_dimensions[1].height = 22
+
+        for row_idx, row in enumerate(edited_df.itertuples(index=False), 2):
+            for col_idx, val in enumerate(row, 1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=val if val is not None and val != "" else None)
+                cell.alignment = Alignment(horizontal="right")
+
+        col_widths = [35, 14, 30, 12, 12, 12, 12, 20]
+        for i, width in enumerate(col_widths, 1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
+
+        buf = _io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        vendor = st.session_state.get("vendor_name", "products")
+        fname  = f"wolt_export_{vendor}.xlsx".replace(" ", "_")
+        st.download_button(
+            "⬇ Download Excel",
+            data=buf,
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        st.success(f"Ready — {len(edited_df)} products in {fname}")
+
+    # ── Section 3: Bundle images ──────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Bundle product images")
+    st.caption(
+        "Images processed via the Image Processor are listed below. "
+        "Name your product images to match column A of the Excel so Wolt can pair them automatically."
+    )
+
+    img_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_images")
+    png_files = sorted(f for f in os.listdir(img_dir) if f.endswith(".png")) if os.path.isdir(img_dir) else []
+
+    if png_files:
+        selected = st.multiselect("Select images to include in ZIP", png_files, default=png_files[:min(len(png_files), 10)])
+        if selected and st.button("Download Images ZIP", use_container_width=True):
+            zip_buf = _io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for fname in selected:
+                    zf.write(os.path.join(img_dir, fname), fname)
+            zip_buf.seek(0)
+            st.download_button(
+                "⬇ Download ZIP",
+                data=zip_buf,
+                file_name="wolt_images.zip",
+                mime="application/zip",
+                use_container_width=True,
+                key="dl_zip",
+            )
+    else:
+        st.info("No processed images yet — use the Image Processor page to create catalog images first.")
+
+    # ── Section 4: Submit ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Submit to Wolt")
+    st.markdown("""
+1. Download the Excel file above
+2. Download the images ZIP
+3. Open the Monday form and attach both files
+""")
+    st.link_button(
+        "Open Monday Form →",
+        "https://forms.monday.com/forms/2386872fef915d70f6a9ba86cea156f6?r=use1",
+        use_container_width=True,
+        type="primary",
+    )
+
+
+# ─────────────────────────────────────────────
+#  MOBILE BOTTOM NAV
+# ─────────────────────────────────────────────
+
+def mobile_bottom_nav():
+    current = st.session_state.page
+
+    SVG = {
+        "home": '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>',
+        "upload": '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>',
+        "review": '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+        "results": '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>',
+        "images": '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>',
+    }
+
+    items = [
+        (SVG["home"],    "Home",    "home",            "Home"),
+        (SVG["upload"],  "Upload",  "upload",          "Upload"),
+        (SVG["review"],  "Review",  "review",          "Review"),
+        (SVG["results"], "Results", "results",         "Results"),
+        (SVG["images"],  "Images",  "image_processor", "Image"),
+    ]
+
+    nav_items_html = ""
+    for svg, label, page, sidebar_text in items:
+        active = "active" if current == page else ""
+        nav_items_html += (
+            f'<button class="mnav-item {active}" onclick="__mnavGo(\'{sidebar_text}\')">'
+            f'<span class="mnav-icon">{svg}</span>'
+            f'<span class="mnav-label">{label}</span>'
+            f'</button>'
+        )
+
+    html = f"""
+    <script>
+    (function() {{
+        if (window.parent.innerWidth > 768) return;
+
+        // Detect dark mode from Streamlit's app background
+        function isDark() {{
+            var app = window.parent.document.querySelector('[data-testid="stApp"]');
+            if (!app) return false;
+            var bg = window.parent.getComputedStyle(app).backgroundColor;
+            var parts = bg.replace('rgb(','').replace(')','').split(',').map(Number);
+            return parts.length === 3 ? (parts[0]+parts[1]+parts[2])/3 < 100 : false;
+        }}
+
+        var dark = isDark();
+        var navBg      = dark ? '#1a1a2e' : '#ffffff';
+        var navBorder  = dark ? '#2e2e3e' : '#e5e5e5';
+        var iconColor  = dark ? '#666'    : '#aaa';
+        var activeColor = '#e24b4a';
+
+        var existing = window.parent.document.getElementById('__mnav');
+        if (existing) existing.remove();
+
+        window.parent.__mnavGo = function(text) {{
+            var btns = window.parent.document.querySelectorAll('[data-testid="stSidebar"] button');
+            for (var i = 0; i < btns.length; i++) {{
+                if (btns[i].textContent.includes(text)) {{ btns[i].click(); return; }}
+            }}
+        }};
+
+        var nav = window.parent.document.createElement('div');
+        nav.id = '__mnav';
+        nav.innerHTML = `
+            <style>
+            #__mnav {{
+                position:fixed;bottom:0;left:0;right:0;
+                background:${{navBg}};
+                border-top:1px solid ${{navBorder}};
+                display:flex;height:62px;z-index:999999;
+                box-shadow:0 -2px 12px rgba(0,0,0,.12);
+            }}
+            #__mnav .mnav-item {{
+                flex:1;display:flex;flex-direction:column;
+                align-items:center;justify-content:center;
+                cursor:pointer;border:none;background:none;
+                color:${{iconColor}};gap:3px;padding:6px 2px;
+                -webkit-tap-highlight-color:transparent;
+                transition:color .15s;
+            }}
+            #__mnav .mnav-item.active {{ color:${{activeColor}}; }}
+            #__mnav .mnav-icon svg {{ display:block; }}
+            #__mnav .mnav-label {{ font-size:9px;font-family:-apple-system,sans-serif;letter-spacing:.3px; }}
+            </style>
+            {nav_items_html}
+        `;
+        window.parent.document.body.appendChild(nav);
+
+        var main = window.parent.document.querySelector('.main .block-container');
+        if (main) main.style.paddingBottom = '80px';
+    }})();
+    </script>
+    """
+    components.html(html, height=0)
+
+
+# ─────────────────────────────────────────────
 #  ROUTER
 # ─────────────────────────────────────────────
 
 pages = {
-    "upload":  page_upload,
-    "review":  page_review,
-    "results": page_results,
-    "catalog": page_catalog,
+    "home":            page_home,
+    "upload":          page_upload,
+    "review":          page_review,
+    "results":         page_results,
+    "catalog":         page_catalog,
+    "wolt":            page_wolt,
+    "wolt_export":     page_wolt_export,
+    "image_processor": page_image_processor,
 }
 
 pages[st.session_state.page]()
+mobile_bottom_nav()

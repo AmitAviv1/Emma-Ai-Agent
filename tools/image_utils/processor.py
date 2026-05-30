@@ -1,5 +1,6 @@
 import os
-from PIL import Image, ImageOps
+import numpy as np
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 from rembg import remove
 import io
 import re
@@ -28,15 +29,30 @@ def process_product_images(input_image_path, product_name, output_directory="pro
     with open(input_image_path, "rb") as input_file:
         input_data = input_file.read()
 
-        print("🔧 [LOG] Removing background...")
-        subject = remove(input_data)
-        img = Image.open(io.BytesIO(subject)).convert("RGBA")
-        
+        # Skip rembg if the image already has a transparent background
+        # (re-processing a pre-cut image introduces blur)
+        pre = Image.open(io.BytesIO(input_data)).convert("RGBA")
+        arr_pre = np.array(pre)
+        total_px = arr_pre.shape[0] * arr_pre.shape[1]
+        already_transparent = np.sum(arr_pre[:, :, 3] == 0) / total_px > 0.10
+
+        if already_transparent:
+            print("🔧 [LOG] Image already has transparent background — skipping rembg...")
+            arr = arr_pre
+        else:
+            print("🔧 [LOG] Removing background...")
+            subject = remove(input_data)
+            arr = np.array(Image.open(io.BytesIO(subject)).convert("RGBA"))
+
+        # Zero out near-transparent stray pixels so getbbox() stays tight
+        arr[arr[:, :, 3] < 20, 3] = 0
+        img = Image.fromarray(arr)
+
         bbox = img.getbbox()
         if not bbox:
             print("❌ [ERROR] No product detected in image.")
             return None
-        
+
         cropped_subject = img.crop(bbox)
         
         # --- 1000x1000 Format ---
@@ -56,32 +72,45 @@ def process_product_images(input_image_path, product_name, output_directory="pro
         return square_path, rect_path
 
 def create_formatted_image(subject_img, target_size):
-    """
-    פונקציית עזר לשינוי גודל, מירכוז והוספת פאדינג (Padding).
-    """
-    # יצירת רקע שקוף חדש בגודל המטרה
-    canvas = Image.new("RGBA", target_size, (0, 0, 0, 0))
-    
-    # חישוב הפרופורציות לשינוי גודל
     target_w, target_h = target_size
     subject_w, subject_h = subject_img.size
-    
-    # השארת מרווח ביטחון (Padding) של 10% מסביב למוצר כדי שייראה טוב
-    padding_pct = 0.10
+
+    padding_pct = 0.12
     safe_w = int(target_w * (1 - padding_pct * 2))
     safe_h = int(target_h * (1 - padding_pct * 2))
-    
-    # שינוי גודל המוצר בצורה פרופורציונלית (Thumbnail)
+
     ratio = min(safe_w / subject_w, safe_h / subject_h)
     new_w = int(subject_w * ratio)
     new_h = int(subject_h * ratio)
-    resized_subject = subject_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    
-    # חישוב המיקום להדבקת המוצר במרכז ה-Canvas
+    resized = subject_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    # Sharpness boost — UnsharpMask gives crisper edges than simple Sharpness
+    r, g, b, a = resized.split()
+    rgb = Image.merge("RGB", (r, g, b))
+    rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140, threshold=2))
+    r, g, b = rgb.split()
+    resized = Image.merge("RGBA", (r, g, b, a))
+
     paste_x = (target_w - new_w) // 2
     paste_y = (target_h - new_h) // 2
-    
-    # הדבקת המוצר הממורכז על הרקע השקוף
-    canvas.paste(resized_subject, (paste_x, paste_y), resized_subject)
-    
-    return canvas
+
+    # Drop shadow: offset, same shape as product alpha, then blur
+    shadow_ox = int(target_w * 0.012)
+    shadow_oy = int(target_h * 0.018)
+    blur_r    = int(min(target_w, target_h) * 0.022)
+
+    alpha = resized.split()[3]
+    shadow_layer = Image.new("RGBA", target_size, (0, 0, 0, 0))
+    shadow_fill  = Image.new("RGBA", (new_w, new_h), (20, 20, 20, 150))
+    shadow_layer.paste(shadow_fill, (paste_x + shadow_ox, paste_y + shadow_oy), alpha)
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(blur_r))
+
+    # Composite: white → shadow → product
+    canvas = Image.new("RGBA", target_size, (255, 255, 255, 255))
+    canvas = Image.alpha_composite(canvas, shadow_layer)
+    canvas.paste(resized, (paste_x, paste_y), resized)
+
+    # Flatten to RGB (white background, no transparency)
+    result = Image.new("RGB", target_size, (255, 255, 255))
+    result.paste(canvas, mask=canvas.split()[3])
+    return result

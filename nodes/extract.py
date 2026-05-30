@@ -4,12 +4,19 @@ import pdfplumber
 import fitz  # pymupdf — pip install pymupdf, no system dependencies needed
 from typing import List, Optional, Tuple
 from pydantic import BaseModel, Field
-from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from dotenv import load_dotenv
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import re
+import sys
+import os as _os
+sys.path.insert(0, _os.path.dirname(__file__))
+from suppliers import (
+    identify_supplier_from_text,
+    identify_supplier_from_image,
+    get_supplier_profile,
+    build_vision_prompt,
+)
 
 load_dotenv()
 
@@ -19,7 +26,8 @@ load_dotenv()
 
 LLM_PROVIDER    = os.getenv("LLM_PROVIDER", "auto")
 OPENAI_MODEL    = "gpt-4o"
-ANTHROPIC_MODEL = "claude-sonnet-4-5"   # best Hebrew OCR; swap to claude-opus-4-5 for max quality
+ANTHROPIC_MODEL = "claude-sonnet-4-6"   # best Hebrew OCR; swap to claude-opus-4-7 for max quality
+GEMINI_MODEL    = "gemini-2.5-flash"    # current stable — fast, cheap, excellent Hebrew OCR
 
 
 # ─────────────────────────────────────────────
@@ -34,7 +42,10 @@ class Product(BaseModel):
     ))
     sku: str = Field(
         default="",
-        description="Leave as empty string. This invoice format has no separate SKU column."
+        description=(
+            "Catalog / item number if one exists (e.g. NT-95, C753/H). "
+            "Leave empty if no SKU column exists in this invoice."
+        )
     )
     barcode: str = Field(
         default="",
@@ -46,13 +57,23 @@ class Product(BaseModel):
     )
     quantity: float = Field(description="Number from the כמות column. Must be positive.")
     cost: float = Field(description=(
-        "Number from the סה\"כ נטו column (LINE TOTAL — not unit price). "
+        "Number from the סה\"כ נטו / סכום נטו column (LINE TOTAL — not unit price). "
         "0.0 is valid when a product has 100% discount. Never negative."
     ))
 
 
 class InvoiceExtraction(BaseModel):
-    vendor_name: str = Field(description="Supplier name exactly as printed on the invoice header.")
+    vendor_name:    str = Field(description="Supplier name exactly as printed on the invoice header.")
+    invoice_number: str = Field(default="", description=(
+        "Invoice number as printed — e.g. 01/042665, 49416, IN264010392, 103805. "
+        "Look for מספר / מס' / חשבונית מס near the top of the invoice. "
+        "Leave empty if not found."
+    ))
+    invoice_date:   str = Field(default="", description=(
+        "Invoice date in YYYY-MM-DD format. "
+        "Look for תאריך near the top. Convert DD/MM/YYYY or DD/MM/YY to YYYY-MM-DD. "
+        "Leave empty if not found."
+    ))
     products: List[Product]
 
 
@@ -65,17 +86,36 @@ _base_cache: dict = {}
 
 def _get_base_llm(provider: Optional[str] = None):
     provider = provider or LLM_PROVIDER
+
+    # Auto-detection priority: Anthropic → Gemini → OpenAI
     if provider == "auto":
-        provider = "anthropic" if os.getenv("ANTHROPIC_API_KEY") else "openai"
+        if os.getenv("ANTHROPIC_API_KEY"):
+            provider = "anthropic"
+        elif os.getenv("GOOGLE_API_KEY"):
+            provider = "gemini"
+        else:
+            provider = "openai"
+
     if provider not in _base_cache:
         if provider == "anthropic":
+            from langchain_anthropic import ChatAnthropic
             _base_cache[provider] = ChatAnthropic(
                 model=ANTHROPIC_MODEL, temperature=0, max_tokens=8192
             )
+        elif provider == "gemini":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            _base_cache[provider] = ChatGoogleGenerativeAI(
+                model=GEMINI_MODEL,
+                temperature=0,
+                max_output_tokens=8192,
+                google_api_key=os.getenv("GOOGLE_API_KEY"),
+            )
         else:
+            from langchain_openai import ChatOpenAI
             _base_cache[provider] = ChatOpenAI(
                 model=OPENAI_MODEL, temperature=0, max_tokens=8192
             )
+
     return _base_cache[provider]
 
 
@@ -119,31 +159,53 @@ NEVER:
 - Translate Hebrew text
 - Skip any product row
 - Use the same product name for multiple rows
+- Mix the SKU code into the product name — they are SEPARATE fields
 
 ALWAYS:
-- Copy each product's Hebrew description verbatim from the תאור פריט column
-- Copy each barcode digit-by-digit from the ברקוד / מס' פריט column
-- Use סה"כ נטו (line total) as cost — NOT נטו ליחידה (unit price)
+- Copy each product's Hebrew description verbatim from the שם פריט / תאור פריט column
+- Put the item code (NT-95, NT-202 etc.) in the sku field, NOT in the name
+- Copy each barcode digit-by-digit from the ברקוד column
+- Use סכום נטו / סה"כ נטו (line total) as cost — NOT unit price
 - Record cost=0.0 for rows where price shows 0 or is crossed out with 0 written
+
+HEBREW LETTER ACCURACY — these pairs are commonly confused:
+- ב (bet) vs כ (kaf) — ב is closed on the right, כ is open
+- ד (dalet) vs ר (resh) — ד has a right-angle bottom-right corner, ר is rounded
+- ה (he) vs ח (het) — ה has a gap at top-left, ח is fully closed at top
+- ו (vav) vs ז (zayin) — ו is a plain vertical stroke, ז has a horizontal foot
+- ם (final mem) vs מ (mem) — ם is fully closed, מ is open at bottom-right
+- ן (final nun) vs נ (nun) — ן descends below the line, נ stays on the baseline
+- ף (final pe) vs פ (pe) — ף has a descender, פ is closed at bottom
+- ץ (final tsadi) vs צ (tsadi) — ץ descends, צ stays on baseline
+- י (yod) vs ' (apostrophe) — י is a Hebrew letter, never substitute with a punctuation mark
+When in doubt about a single character, use your best judgement based on the surrounding word context.
 """
 
 _VISION_PROMPT = """\
-This is page {page_num} of a Pet Pharm (פט פארם) Israeli supplier invoice.
+This is page {page_num} of an Israeli supplier invoice.
 
 Column layout (the table is RTL — Hebrew reads right to left):
   RIGHT SIDE of page → LEFT SIDE of page
-  מס' (#) | תאור פריט (description) | כמות (qty) | ברוטו ליחידה | %הנחה | נטו ליחידה | סה"כ נטו | ברקוד
+  מס' פריט/SKU | שם פריט (description) | כמות (qty) | מחיר יחידה | %הנחה | נטו ליחידה | סכום נטו | ברקוד
 
 The ברקוד (barcode) column is on the FAR LEFT edge of the table.
 These are 13-digit EAN codes. Read every digit carefully.
+Some rows may have no barcode — if so, leave barcode empty and fill the sku field with the
+item code printed in the rightmost column (e.g. NT-95, NT-202, C753/H).
 
-The סה"כ נטו column is the SECOND from the left — this is the line total (cost).
-Do NOT use ברוטו ליחידה or נטו ליחידה as cost.
+The סכום נטו / סה"כ נטו column is the line total (cost). Do NOT use unit price as cost.
+
+CRITICAL NAME RULE:
+- The product name (שם פריט) is ONLY the Hebrew description column
+- Do NOT append the SKU code to the name — they are separate fields
+- Example: name="קרניבור עצם קשר טבעית 20 ס\"מ"  sku="NT-95"  (correct)
+- Example: name="קרניבור עצם קשר טבעית 20 ס\"מ NT-95"  (WRONG — SKU belongs in sku field)
+- Copy the Hebrew name EXACTLY — every word, volume, and brand
 
 Rules:
-- Each barcode number = one unique product row
-- Multi-line descriptions belong to the row with that barcode
-- Rows 7 and 8 on page 1 may show crossed-out prices with 0.00 — cost=0.0 for those
+- Each row (identified by barcode or SKU) = one unique product
+- Multi-line descriptions belong to the row with that barcode/SKU
+- Rows with cost=0 or crossed-out price → cost=0.0 (free/promo units)
 - Extract EVERY row; do not stop early
 - If a barcode matches one in the catalog list below, use that catalog name EXACTLY
 
@@ -152,21 +214,26 @@ Return all {expected} products on this page.
 
 
 def extract_from_image(image_path: str, page_num: int = 1,
-                       expected: int = 0, vendor_hint: str = "") -> dict:
+                       expected: int = 0, vendor_hint: str = "",
+                       supplier_key: Optional[str] = None,
+                       total_pages: int = 1) -> dict:
     """Single-stage: image → structured InvoiceExtraction directly."""
-    print(f"🔍 [LOG] Direct vision extraction (page {page_num})...")
+    print(f"🔍 [LOG] Direct vision extraction (page {page_num}/{total_pages})...")
     b64 = encode_image(image_path)
+    llm_plain = _get_base_llm()
     llm = _get_structured_llm(InvoiceExtraction)
 
-    prompt = _VISION_PROMPT.format(
-        page_num=page_num,
-        expected=f"approximately {expected}" if expected else "all"
-    )
-    if vendor_hint and vendor_hint != "Unknown":
-        prompt += f"\nVendor already identified: {vendor_hint}"
+    # Identify supplier if not already known
+    if not supplier_key:
+        supplier_key = identify_supplier_from_image(b64, llm_plain)
 
-    # Inject known catalog so model can anchor on exact names and barcodes
-    prompt += "\n\n" + _catalog_reference_block()
+    profile = get_supplier_profile(supplier_key)
+    prompt  = build_vision_prompt(
+        profile,
+        page_num=page_num,
+        total_pages=total_pages,
+        catalog_block=_catalog_reference_block(supplier_key),
+    )
 
     result: InvoiceExtraction = llm.invoke([
         SystemMessage(content=_VISION_SYSTEM),
@@ -181,10 +248,14 @@ def extract_from_image(image_path: str, page_num: int = 1,
 
     result, warnings = validate_extraction(result)
     corrected, corrections = correct_products(result.products)
+    products_dicts = [p.model_dump() for p in corrected]
+    merged, merge_logs = merge_promotional_rows(products_dicts)
     return {
-        "products":    [p.model_dump() for p in corrected],
-        "vendor_name": result.vendor_name,
-        "warnings":    warnings + corrections,
+        "products":       merged,
+        "vendor_name":    result.vendor_name,
+        "invoice_number": result.invoice_number,
+        "invoice_date":   result.invoice_date,
+        "warnings":       warnings + corrections + merge_logs,
     }
 
 
@@ -201,11 +272,24 @@ def validate_extraction(
     for i, p in enumerate(extraction.products):
         label = f"Row {i+1} (bc={p.barcode or 'none'})"
 
-        if p.barcode and not re.match(r"^\d+$", p.barcode):
-            warnings.append(f"{label}: barcode '{p.barcode}' has non-digit chars — check manually.")
+        # Clean barcode — strip whitespace, asterisks (tzama invoices use *barcode*)
+        bc = p.barcode.strip().strip("*")
+        if bc != p.barcode:
+            p = p.model_copy(update={"barcode": bc})
 
-        if p.barcode and len(p.barcode) not in (8, 12, 13):
-            warnings.append(f"{label}: barcode length {len(p.barcode)} unexpected (8/12/13).")
+        # If barcode contains non-digits or a decimal point it's not a real barcode
+        # (model confused a record number like 5692.3 for a barcode) — clear it
+        if p.barcode and not re.match(r"^\d+$", p.barcode):
+            warnings.append(f"{label}: '{p.barcode}' is not a valid barcode — cleared.")
+            p = p.model_copy(update={"barcode": ""})
+
+        # Use SKU as fallback identifier when barcode is missing
+        if not p.barcode.strip() and p.sku.strip():
+            p = p.model_copy(update={"barcode": f"SKU-{p.sku}"})
+
+        # Barcode length check (warn but keep — some valid codes are 8 or 12 digits)
+        if p.barcode and not p.barcode.startswith("SKU-") and len(p.barcode) not in (8, 12, 13):
+            warnings.append(f"{label}: barcode '{p.barcode}' length {len(p.barcode)} unusual — verify.")
 
         if p.cost < 0:
             warnings.append(f"{label}: negative cost {p.cost} — corrected to 0.")
@@ -226,7 +310,12 @@ def validate_extraction(
     for w in warnings:
         print(f"⚠️  [VALIDATION] {w}")
 
-    return InvoiceExtraction(vendor_name=extraction.vendor_name, products=clean), warnings
+    return InvoiceExtraction(
+        vendor_name=extraction.vendor_name,
+        invoice_number=extraction.invoice_number,
+        invoice_date=extraction.invoice_date,
+        products=clean,
+    ), warnings
 
 
 # ─────────────────────────────────────────────
@@ -266,6 +355,22 @@ PRODUCT_CATALOG: dict = {
     "8596075002336": "קיווי פאוץ' ורוד לחטיפים מסיליקון עם אבזם פלדה לתליה 10*5*13.5 ס\"מ",
     "8596075002343": "קיווי פאוץ' כחול לחטיפים מסיליקון עם אבזם פלדה לתליה 10*5*13.5 ס\"מ",
     "8596075001445": "קיווי צלחת עם ידיות נשיאה מעוצבת שחורה וציפורים כתומות 750 מ\"ל 24 ס\"מ",
+    # ── א.א פטקאר / PET-CARE — confirmed from invoice 49416 dated 15/02/2026 ──
+    "0693493258517": "קרניבור עצם קשר טבעית 20 ס\"מ NT-95",
+    "0693493253598": "קרניבור 1 עצם דחוסה טבעית 30 ס\"מ NT-93",
+    "0693493253871": "קרניבור לחי דחוסה וגיד 2 יחידות NT-78",
+    "0693493253826": "קרניבור קרקפת 12 ס\"מ מאה גרם NT-72",
+    "726529694734":  "קרניבור חטיפי אילוף 400 גרם NT-440",
+    "SKU-NT-202":    "קרניבור מיקס חטיפים חצי ק\"ג NT-202",
+    "0693493292429": "קרניבור קרקפת גמל 500 גרם NT-160",
+    "0693493292436": "קרניבור שלוש לחי (באפלו גמל) NT-155",
+    "0788792115293": "קרניבור 3 קרקפות גמל ובאפלו NT-154",
+    "0726529694406": "קרניבור סחוס עטוף בברווז NT-113",
+    "0726529694383": "קרניבור נתחי ברווז NT-111",
+    "0726529694376": "קרניבור נתחי עוף NT-110",
+    "0693493292641": "קרניבור לחי מגולגלת לבנה NT-101",
+    "0693493292634": "קרניבור לחי גמל מגולגלת NT-100",
+    "8019808233819": "תיק חטיפים קמון C753/H",
 }
 
 
@@ -400,21 +505,112 @@ def correct_products(products: List[Product]) -> Tuple[List[Product], List[str]]
     return fixed, corrections
 
 
-def _catalog_reference_block() -> str:
-    """Formats the product catalog as a reference list for injection into the vision prompt."""
+# Map each supplier key to the barcode prefixes that belong to their products.
+# Used to filter the catalog block so only relevant entries are injected.
+_SUPPLIER_BARCODE_PREFIXES: dict = {
+    "pet_pharm":    ["8596075", "742797", "702160", "4743318", "7290111", "5060420", "6932844"],
+    "pets_pro":     ["6976551", "6971067"],
+    "pet_care":     ["0693493", "7265296", "0726529", "0788792", "8019808", "SKU-NT"],
+    "beit_erez":    ["8682"],
+    "fish_and_pets": ["8682"],
+    "tzama":        ["4250231"],
+    "dudi":         ["8430235"],
+}
+
+
+def _catalog_reference_block(supplier_key: Optional[str] = None) -> str:
+    """
+    Formats the product catalog as a reference list for injection into the vision prompt.
+    When supplier_key is given, only entries relevant to that supplier are included,
+    keeping the prompt concise and reducing hallucination from unrelated products.
+    """
+    prefixes = _SUPPLIER_BARCODE_PREFIXES.get(supplier_key or "", []) if supplier_key else []
+
+    def _relevant(bc: str) -> bool:
+        if not prefixes:
+            return True
+        return any(bc.startswith(p) for p in prefixes)
+
+    entries = [(bc, name) for bc, name in PRODUCT_CATALOG.items() if _relevant(bc)]
+    if not entries:
+        # Fall back to full catalog if nothing matched (e.g. new supplier)
+        entries = list(PRODUCT_CATALOG.items())
+
     lines = ["Known products in this vendor's catalog (barcode → exact name):"]
-    for bc, name in PRODUCT_CATALOG.items():
+    for bc, name in entries:
         lines.append(f"  {bc} → {name}")
     return "\n".join(lines)
 
 
+def merge_promotional_rows(products: List[dict]) -> Tuple[List[dict], List[str]]:
+    """
+    Merges "buy X get Y free" invoice rows into a single product with:
+      - combined quantity (paid + free)
+      - original total cost (unchanged)
+      - recalculated effective unit cost = cost / total_qty
+
+    Detection rule: two consecutive rows share the same barcode where
+    one row has cost > 0 (paid) and the next has cost == 0 (free gift).
+
+    Example:
+      NT-95 | qty 16 | cost 160.00  →  merged:
+      NT-95 | qty  4 | cost   0.00       NT-95 | qty 20 | cost 160.00 | unit 8.00
+    """
+    if not products:
+        return products, []
+
+    merged   = []
+    logs     = []
+    skip_next = False
+
+    for i, p in enumerate(products):
+        if skip_next:
+            skip_next = False
+            continue
+
+        # Look ahead: next row same barcode and cost=0?
+        if i + 1 < len(products):
+            nxt = products[i + 1]
+            same_bc   = p.get("barcode") and p["barcode"] == nxt.get("barcode")
+            paid_free = p.get("cost", 0) > 0 and nxt.get("cost", 0) == 0
+
+            if same_bc and paid_free:
+                total_qty  = p["quantity"] + nxt["quantity"]
+                total_cost = p["cost"]
+                unit_cost  = round(total_cost / total_qty, 4) if total_qty else 0
+
+                merged_product = {
+                    **p,
+                    "quantity": total_qty,
+                    "cost":     total_cost,
+                    "unit_cost_effective": unit_cost,
+                }
+                merged.append(merged_product)
+                logs.append(
+                    f"Merged promo rows for {p['barcode']}: "
+                    f"{p['quantity']} paid + {nxt['quantity']} free = "
+                    f"{total_qty} units @ ₪{unit_cost:.4f} effective unit cost"
+                )
+                skip_next = True
+                continue
+
+        merged.append(p)
+
+    for log in logs:
+        print(f"🔀 [MERGE] {log}")
+
+    return merged, logs
+
+
 
 def run_vision_on_image(image_path: str, page_num: int = 1,
-                        vendor_hint: str = "") -> dict:
+                        vendor_hint: str = "", supplier_key: Optional[str] = None,
+                        total_pages: int = 1) -> dict:
     preprocessed = preprocess_image(image_path)
     try:
         return extract_from_image(
-            preprocessed, page_num=page_num, vendor_hint=vendor_hint
+            preprocessed, page_num=page_num, vendor_hint=vendor_hint,
+            supplier_key=supplier_key, total_pages=total_pages,
         )
     except Exception as e:
         print(f"❌ [ERROR] Vision failed on {image_path}: {e}")
@@ -452,9 +648,42 @@ def _pdf_to_pil_images(file_path: str, dpi: int = 300) -> List[Image.Image]:
     return imgs
 
 
+def _extract_rtl_page_text(page) -> str:
+    """
+    Extract text from a single pdfplumber page in correct RTL reading order.
+    Groups words into lines by vertical position, then sorts each line right→left.
+    Falls back to extract_text() if word extraction yields nothing.
+    """
+    words = page.extract_words(x_tolerance=3, y_tolerance=3, keep_blank_chars=False)
+    if not words:
+        return page.extract_text() or ""
+
+    # Round top coordinate to 5-pixel bands so words on the same visual line cluster
+    for w in words:
+        w["_line"] = round(w["top"] / 5) * 5
+
+    lines: list[str] = []
+    current_band = None
+    current_words: list[dict] = []
+
+    for w in sorted(words, key=lambda x: (x["_line"], -x["x0"])):
+        if w["_line"] != current_band:
+            if current_words:
+                lines.append(" ".join(cw["text"] for cw in current_words))
+            current_band = w["_line"]
+            current_words = [w]
+        else:
+            current_words.append(w)
+
+    if current_words:
+        lines.append(" ".join(cw["text"] for cw in current_words))
+
+    return "\n".join(lines)
+
+
 def get_pdf_type_and_content(file_path: str):
     with pdfplumber.open(file_path) as pdf:
-        pages_text = [p.extract_text() or "" for p in pdf.pages]
+        pages_text = [_extract_rtl_page_text(p) for p in pdf.pages]
 
     avg = sum(len(t.strip()) for t in pages_text) / max(len(pages_text), 1)
     full = "\n--- PAGE BREAK ---\n".join(pages_text)
@@ -491,19 +720,34 @@ Invoice text:
 """
 
 
-def extract_from_digital_pdf(text: str) -> dict:
+def extract_from_digital_pdf(text: str, supplier_key: Optional[str] = None) -> dict:
     print("⚙️  [LOG] Parsing digital PDF text...")
+    profile = get_supplier_profile(supplier_key)
+
+    # Build a supplier-aware text prompt
+    supplier_hint = f"""
+Supplier: {profile['display_name']}
+Cost column: {profile['cost_column']}
+Has SKU column: {profile.get('has_sku', False)}
+{profile['prompt_extra'].strip()}
+"""
+    full_prompt = _DIGITAL_PROMPT.format(text=text) + f"\n\nSUPPLIER CONTEXT:\n{supplier_hint}"
+
     llm = _get_structured_llm(InvoiceExtraction)
     result = llm.invoke([
         SystemMessage(content=_DIGITAL_SYSTEM),
-        HumanMessage(content=_DIGITAL_PROMPT.format(text=text))
+        HumanMessage(content=full_prompt)
     ])
     result, warnings = validate_extraction(result)
     corrected, corrections = correct_products(result.products)
+    products_dicts = [p.model_dump() for p in corrected]
+    merged, merge_logs = merge_promotional_rows(products_dicts)
     return {
-        "products":    [p.model_dump() for p in corrected],
-        "vendor_name": result.vendor_name,
-        "warnings":    warnings + corrections,
+        "products":       merged,
+        "vendor_name":    result.vendor_name or profile["display_name"],
+        "invoice_number": result.invoice_number,
+        "invoice_date":   result.invoice_date,
+        "warnings":       warnings + corrections + merge_logs,
     }
 
 
@@ -517,47 +761,85 @@ def extract_invoice_data(state: dict) -> dict:
 
     ext          = os.path.splitext(file_path)[1].lower()
     all_products: list = []
-    vendor_name  = "Unknown"
+    vendor_name    = "Unknown"
+    invoice_number = ""
+    invoice_date   = ""
     all_warnings: list = []
+    supplier_key = None   # identified once, reused across all pages
 
     try:
         if ext == ".pdf":
             pdf_type, content = get_pdf_type_and_content(file_path)
 
             if pdf_type == "digital":
-                d            = extract_from_digital_pdf(content)
-                all_products = d["products"]
-                vendor_name  = d["vendor_name"]
-                all_warnings = d["warnings"]
+                # Try to identify supplier from text first (fast, no LLM)
+                supplier_key = identify_supplier_from_text(content)
+                if supplier_key:
+                    profile = get_supplier_profile(supplier_key)
+                    vendor_name = profile["display_name"]
+                d              = extract_from_digital_pdf(content, supplier_key=supplier_key)
+                all_products   = d["products"]
+                vendor_name    = d["vendor_name"] or vendor_name
+                invoice_number = d.get("invoice_number", "")
+                invoice_date   = d.get("invoice_date", "")
+                all_warnings   = d["warnings"]
             else:
+                total_pages = len(content)
                 for i, img in enumerate(content):
-                    print(f"📄 [LOG] Page {i+1}/{len(content)}...")
+                    print(f"📄 [LOG] Page {i+1}/{total_pages}...")
                     tmp = f"temp_page_{i}.jpg"
                     img.save(tmp, "JPEG")
 
-                    d = run_vision_on_image(tmp, page_num=i + 1, vendor_hint=vendor_name)
+                    d = run_vision_on_image(
+                        tmp, page_num=i + 1,
+                        vendor_hint=vendor_name,
+                        supplier_key=supplier_key,
+                        total_pages=total_pages,
+                    )
                     all_products.extend(d["products"])
                     all_warnings.extend(d.get("warnings", []))
+
                     if d.get("vendor_name") and vendor_name == "Unknown":
                         vendor_name = d["vendor_name"]
+                    # Capture invoice number/date from first page that has them
+                    if not invoice_number:
+                        invoice_number = d.get("invoice_number", "")
+                    if not invoice_date:
+                        invoice_date = d.get("invoice_date", "")
+                    if not supplier_key and d.get("supplier_key"):
+                        supplier_key = d["supplier_key"]
 
                     if os.path.exists(tmp):
                         os.remove(tmp)
 
         else:
-            d            = run_vision_on_image(file_path, page_num=1)
-            all_products = d["products"]
-            vendor_name  = d.get("vendor_name", "Unknown")
-            all_warnings = d.get("warnings", [])
+            d              = run_vision_on_image(file_path, page_num=1)
+            all_products   = d["products"]
+            vendor_name    = d.get("vendor_name", "Unknown")
+            invoice_number = d.get("invoice_number", "")
+            invoice_date   = d.get("invoice_date", "")
+            all_warnings   = d.get("warnings", [])
 
         print(f"✅ [LOG] Extracted {len(all_products)} products from {vendor_name}")
+        if invoice_number:
+            print(f"📄 [LOG] Invoice: {invoice_number}  Date: {invoice_date}")
         if all_warnings:
             print(f"⚠️  [LOG] {len(all_warnings)} validation warning(s).")
 
+        # Enrich with Wolt catalog data (sell price, margin, match info)
+        try:
+            from wolt_catalog import enrich_products, is_loaded
+            if is_loaded():
+                all_products = enrich_products(all_products)
+        except ImportError:
+            pass
+
         return {
-            "products":    all_products,
-            "vendor_name": vendor_name,
-            "warnings":    all_warnings,
+            "products":       all_products,
+            "vendor_name":    vendor_name,
+            "invoice_number": invoice_number,
+            "invoice_date":   invoice_date,
+            "warnings":       all_warnings,
             "status": f"Successfully processed {len(all_products)} items from {vendor_name}",
         }
 
