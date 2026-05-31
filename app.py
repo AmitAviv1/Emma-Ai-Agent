@@ -786,6 +786,7 @@ def page_image_processor():
     )
 
     skip_rembg = st.checkbox("Background already removed — skip background removal", value=False)
+    add_shadow = st.checkbox("Add drop shadow", value=True)
 
     if uploaded and product_name:
         st.image(uploaded, caption="Original", width=260)
@@ -833,7 +834,7 @@ def page_image_processor():
                     ]
                     for size, tag, fname in variants:
                         st.write(f"📐 Creating {tag}…")
-                        out = create_formatted_image(cropped, size)
+                        out = create_formatted_image(cropped, size, drop_shadow=add_shadow)
                         path = os.path.join(output_dir, fname)
                         out.save(path, "PNG")
                         buf = _io.BytesIO()

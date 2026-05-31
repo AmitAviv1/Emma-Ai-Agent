@@ -71,7 +71,7 @@ def process_product_images(input_image_path, product_name, output_directory="pro
         print(f"✅ [LOG] Files saved: \n   1. {square_path}\n   2. {rect_path}")
         return square_path, rect_path
 
-def create_formatted_image(subject_img, target_size):
+def create_formatted_image(subject_img, target_size, drop_shadow=True):
     target_w, target_h = target_size
     subject_w, subject_h = subject_img.size
 
@@ -94,20 +94,20 @@ def create_formatted_image(subject_img, target_size):
     paste_x = (target_w - new_w) // 2
     paste_y = (target_h - new_h) // 2
 
-    # Drop shadow: offset, same shape as product alpha, then blur
-    shadow_ox = int(target_w * 0.012)
-    shadow_oy = int(target_h * 0.018)
-    blur_r    = int(min(target_w, target_h) * 0.022)
-
-    alpha = resized.split()[3]
-    shadow_layer = Image.new("RGBA", target_size, (0, 0, 0, 0))
-    shadow_fill  = Image.new("RGBA", (new_w, new_h), (20, 20, 20, 150))
-    shadow_layer.paste(shadow_fill, (paste_x + shadow_ox, paste_y + shadow_oy), alpha)
-    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(blur_r))
-
-    # Composite: white → shadow → product
     canvas = Image.new("RGBA", target_size, (255, 255, 255, 255))
-    canvas = Image.alpha_composite(canvas, shadow_layer)
+
+    if drop_shadow:
+        shadow_ox = int(target_w * 0.012)
+        shadow_oy = int(target_h * 0.018)
+        blur_r    = int(min(target_w, target_h) * 0.022)
+
+        alpha = resized.split()[3]
+        shadow_layer = Image.new("RGBA", target_size, (0, 0, 0, 0))
+        shadow_fill  = Image.new("RGBA", (new_w, new_h), (20, 20, 20, 150))
+        shadow_layer.paste(shadow_fill, (paste_x + shadow_ox, paste_y + shadow_oy), alpha)
+        shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(blur_r))
+        canvas = Image.alpha_composite(canvas, shadow_layer)
+
     canvas.paste(resized, (paste_x, paste_y), resized)
 
     # Flatten to RGB (white background, no transparency)
