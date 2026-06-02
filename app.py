@@ -763,111 +763,129 @@ def page_wolt():
 
 def page_image_processor():
     st.title("Image Processor")
-    st.caption("Upload a product image to get a 1000×1000 and 1000×563 PNG with background removed.")
+    st.caption("Upload one or more product images to get 1000×1000 and 1000×563 PNGs with background removed.")
 
-    uploaded = st.file_uploader(
-        "Upload product image",
+    uploaded_files = st.file_uploader(
+        "Upload product images",
         type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
         label_visibility="collapsed",
     )
 
-    # Auto-suggest name from filename; clear old results when a new file is uploaded
-    if uploaded:
-        if st.session_state.get("_imgproc_file") != uploaded.name:
-            st.session_state["_imgproc_file"] = uploaded.name
-            suggested = uploaded.name.rsplit(".", 1)[0].replace("_", " ").replace("-", " ").strip()
-            st.session_state["_imgproc_name"] = suggested
-            st.session_state["_imgproc_results"] = []
-
-    product_name = st.text_input(
-        "Product name",
-        key="_imgproc_name",
-        placeholder="e.g. Vitamin C 500mg",
-    )
+    # Clear stale results when the upload set changes
+    if uploaded_files is not None:
+        upload_key = tuple(f.name for f in uploaded_files)
+        if st.session_state.get("_imgproc_files") != upload_key:
+            st.session_state["_imgproc_files"] = upload_key
+            st.session_state["_imgproc_batch"] = []
 
     skip_rembg = st.checkbox("Background already removed — skip background removal", value=False)
     add_shadow = st.checkbox("Add drop shadow", value=True)
 
-    if uploaded and product_name:
-        st.image(uploaded, caption="Original", width=260)
+    if uploaded_files:
+        st.caption(f"{len(uploaded_files)} image(s) selected — output names will be derived from each filename.")
 
-        if st.button("Process image", type="primary", use_container_width=True):
+        if st.button(f"Process {len(uploaded_files)} image(s)", type="primary", use_container_width=True):
             import io as _io
             from rembg import remove
             from PIL import Image
             from tools.image_utils.processor import create_formatted_image, sanitize_filename
             import numpy as np
 
-            raw = uploaded.getvalue()
-            safe_name = sanitize_filename(product_name)
             output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_images")
             os.makedirs(output_dir, exist_ok=True)
-            results = []
+            batch = []
+            progress = st.progress(0.0, text="Starting…")
 
-            with st.status("Processing image…", expanded=True) as status:
-                img = Image.open(_io.BytesIO(raw)).convert("RGBA")
-                arr = np.array(img)
+            for idx, uploaded in enumerate(uploaded_files, start=1):
+                progress.progress((idx - 1) / len(uploaded_files), text=f"[{idx}/{len(uploaded_files)}] {uploaded.name}")
+                stem = uploaded.name.rsplit(".", 1)[0].replace("_", " ").replace("-", " ").strip()
+                safe_name = sanitize_filename(stem)
+                raw = uploaded.getvalue()
 
-                # Detect if background is already transparent
-                total_px = arr.shape[0] * arr.shape[1]
-                already_transparent = np.sum(arr[:, :, 3] == 0) / total_px > 0.10
+                try:
+                    img = Image.open(_io.BytesIO(raw)).convert("RGBA")
+                    arr = np.array(img)
 
-                if skip_rembg or already_transparent:
-                    st.write("⏭️ Skipping background removal…")
-                else:
-                    st.write("🔧 Removing background…")
-                    arr = np.array(Image.open(_io.BytesIO(remove(raw))).convert("RGBA"))
+                    total_px = arr.shape[0] * arr.shape[1]
+                    already_transparent = np.sum(arr[:, :, 3] == 0) / total_px > 0.10
 
-                # Clean up stray near-transparent pixels
-                arr[arr[:, :, 3] < 20, 3] = 0
-                img = Image.fromarray(arr)
+                    if not (skip_rembg or already_transparent):
+                        arr = np.array(Image.open(_io.BytesIO(remove(raw))).convert("RGBA"))
 
-                bbox = img.getbbox()
-                if not bbox:
-                    status.update(label="No product detected", state="error")
-                    st.error("No product detected. Try a clearer photo.")
-                else:
+                    arr[arr[:, :, 3] < 20, 3] = 0
+                    img = Image.fromarray(arr)
+                    bbox = img.getbbox()
+                    if not bbox:
+                        batch.append({"src": uploaded.name, "error": "No product detected", "variants": []})
+                        continue
+
                     cropped = img.crop(bbox)
                     variants = [
                         ((1000, 1000), "1000×1000", f"{safe_name}.png"),
                         ((1000, 563),  "1000×563",  f"wolt{safe_name}.png"),
                     ]
+                    variant_results = []
                     for size, tag, fname in variants:
-                        st.write(f"📐 Creating {tag}…")
                         out = create_formatted_image(cropped, size, drop_shadow=add_shadow)
-                        path = os.path.join(output_dir, fname)
-                        out.save(path, "PNG")
+                        out.save(os.path.join(output_dir, fname), "PNG")
                         buf = _io.BytesIO()
                         out.save(buf, "PNG")
-                        results.append((buf.getvalue(), fname, tag))
-                    status.update(label="Done!", state="complete", expanded=False)
+                        variant_results.append((buf.getvalue(), fname, tag))
+                    batch.append({"src": uploaded.name, "error": None, "variants": variant_results})
+                except Exception as e:
+                    batch.append({"src": uploaded.name, "error": str(e), "variants": []})
 
-            # Store bytes in session state so downloads don't re-trigger processing
-            st.session_state["_imgproc_results"] = results
+            progress.progress(1.0, text="Done!")
+            st.session_state["_imgproc_batch"] = batch
 
-    elif not uploaded:
+    else:
         st.markdown("""
         <div style="text-align:center;padding:3rem 1rem">
-            <p style="font-size:1.1rem;font-weight:600;color:#444;margin:0.5rem 0">No image yet</p>
-            <p style="color:#999;font-size:0.9rem">Drop a product photo above to get started.</p>
+            <p style="font-size:1.1rem;font-weight:600;color:#444;margin:0.5rem 0">No images yet</p>
+            <p style="color:#999;font-size:0.9rem">Drop one or more product photos above to get started.</p>
         </div>""", unsafe_allow_html=True)
 
     # Results — rendered outside the button block so they survive reruns from download clicks
-    results = st.session_state.get("_imgproc_results", [])
-    if results:
+    batch = st.session_state.get("_imgproc_batch", [])
+    if batch:
         st.markdown("---")
-        col1, col2 = st.columns(2)
-        for col, (data, fname, tag) in zip([col1, col2], results):
-            with col:
-                st.image(data, caption=tag, use_container_width=True)
-                st.download_button(
-                    "Download",
-                    data=data,
-                    file_name=fname,
-                    mime="image/png",
-                    use_container_width=True,
-                    key=f"dl_{tag}",
-                )
+
+        # Bundle all variants into a single zip for convenience
+        import io as _io
+        import zipfile as _zip
+        zip_buf = _io.BytesIO()
+        with _zip.ZipFile(zip_buf, "w", _zip.ZIP_DEFLATED) as zf:
+            for item in batch:
+                for data, fname, _tag in item["variants"]:
+                    zf.writestr(fname, data)
+        if zip_buf.getbuffer().nbytes > 0:
+            st.download_button(
+                "Download all (.zip)",
+                data=zip_buf.getvalue(),
+                file_name="processed_images.zip",
+                mime="application/zip",
+                use_container_width=True,
+                key="dl_all_zip",
+            )
+
+        for i, item in enumerate(batch):
+            st.markdown(f"**{item['src']}**")
+            if item["error"]:
+                st.error(item["error"])
+                continue
+            col1, col2 = st.columns(2)
+            for col, (data, fname, tag) in zip([col1, col2], item["variants"]):
+                with col:
+                    st.image(data, caption=tag, use_container_width=True)
+                    st.download_button(
+                        "Download",
+                        data=data,
+                        file_name=fname,
+                        mime="image/png",
+                        use_container_width=True,
+                        key=f"dl_{i}_{tag}",
+                    )
 
 
 # ─────────────────────────────────────────────
