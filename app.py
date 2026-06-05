@@ -173,6 +173,7 @@ with st.sidebar:
     nav_button("🛒  Wolt Catalog", "wolt")
     nav_button("📦  Wolt Export", "wolt_export")
     nav_button("🖼️  Image Processor", "image_processor")
+    nav_button("🔎  Product Extractor", "product_extract")
     st.markdown("---")
     st.caption("Logs")
     if st.session_state.log_lines:
@@ -761,6 +762,15 @@ def page_wolt():
 #  PAGE: IMAGE PROCESSOR
 # ─────────────────────────────────────────────
 
+class _ExternalImage:
+    """Adapter that mimics Streamlit's UploadedFile for images pushed in via session state."""
+    def __init__(self, name, data):
+        self.name = name
+        self._data = data
+    def getvalue(self):
+        return self._data
+
+
 def page_image_processor():
     st.title("Image Processor")
     st.caption("Upload one or more product images to get 1000×1000 and 1000×563 PNGs with background removed.")
@@ -772,23 +782,61 @@ def page_image_processor():
         label_visibility="collapsed",
     )
 
-    # Clear stale results when the upload set changes
-    if uploaded_files is not None:
-        upload_key = tuple(f.name for f in uploaded_files)
-        if st.session_state.get("_imgproc_files") != upload_key:
-            st.session_state["_imgproc_files"] = upload_key
-            st.session_state["_imgproc_batch"] = []
+    # Images queued from other pages (e.g. Product Extractor's "Send to Image Processor")
+    queued = st.session_state.get("_imgproc_external", [])
+    if queued:
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            st.info(f"📥 {len(queued)} image(s) queued from Product Extractor.")
+        with c2:
+            if st.button("Clear queue", use_container_width=True):
+                st.session_state["_imgproc_external"] = []
+                st.rerun()
+
+    external_items = [_ExternalImage(e["name"], e["bytes"]) for e in queued]
+    all_files = external_items + list(uploaded_files or [])
+
+    # Clear stale results when the working set changes
+    file_key = tuple(f.name for f in all_files)
+    if st.session_state.get("_imgproc_files") != file_key:
+        st.session_state["_imgproc_files"] = file_key
+        st.session_state["_imgproc_batch"] = []
 
     skip_rembg = st.checkbox("Background already removed — skip background removal", value=False)
     add_shadow = st.checkbox("Add drop shadow", value=True)
 
+    uploaded_files = all_files  # use the merged list for the rest of the page
     if uploaded_files:
-        st.caption(f"{len(uploaded_files)} image(s) selected — output names will be derived from each filename.")
+        import io as _io
+        from PIL import Image
+
+        st.caption(f"{len(uploaded_files)} image(s) selected — set rotation per image if needed; output names are derived from each filename.")
+
+        # Per-image rotation grid (4 thumbs per row)
+        THUMBS_PER_ROW = 4
+        rot_options = [0, 90, 180, 270]
+        for row_start in range(0, len(uploaded_files), THUMBS_PER_ROW):
+            cols = st.columns(THUMBS_PER_ROW)
+            for col, uploaded in zip(cols, uploaded_files[row_start:row_start + THUMBS_PER_ROW]):
+                with col:
+                    rot = st.session_state.get(f"rot_{uploaded.name}", 0)
+                    try:
+                        preview = Image.open(_io.BytesIO(uploaded.getvalue()))
+                        if rot:
+                            preview = preview.rotate(-rot, expand=True)
+                        st.image(preview, caption=uploaded.name, use_container_width=True)
+                    except Exception as e:
+                        st.error(f"⚠️ {uploaded.name}: not a valid image ({e})")
+                    st.selectbox(
+                        "Rotate",
+                        options=rot_options,
+                        format_func=lambda x: "0°" if x == 0 else f"{x}° CW",
+                        key=f"rot_{uploaded.name}",
+                        label_visibility="collapsed",
+                    )
 
         if st.button(f"Process {len(uploaded_files)} image(s)", type="primary", use_container_width=True):
-            import io as _io
             from rembg import remove
-            from PIL import Image
             from tools.image_utils.processor import create_formatted_image, sanitize_filename
             import numpy as np
 
@@ -802,6 +850,14 @@ def page_image_processor():
                 stem = uploaded.name.rsplit(".", 1)[0].replace("_", " ").replace("-", " ").strip()
                 safe_name = sanitize_filename(stem)
                 raw = uploaded.getvalue()
+                rot = st.session_state.get(f"rot_{uploaded.name}", 0)
+
+                # Apply rotation up-front so rembg + downstream all see the rotated image
+                if rot:
+                    rotated = Image.open(_io.BytesIO(raw)).rotate(-rot, expand=True)
+                    rot_buf = _io.BytesIO()
+                    rotated.save(rot_buf, format="PNG")
+                    raw = rot_buf.getvalue()
 
                 try:
                     img = Image.open(_io.BytesIO(raw)).convert("RGBA")
@@ -874,10 +930,10 @@ def page_image_processor():
             if item["error"]:
                 st.error(item["error"])
                 continue
-            col1, col2 = st.columns(2)
-            for col, (data, fname, tag) in zip([col1, col2], item["variants"]):
+            cols = st.columns([1, 1, 2])  # two small previews on the left, empty space on the right
+            for col, (data, fname, tag) in zip(cols[:2], item["variants"]):
                 with col:
-                    st.image(data, caption=tag, use_container_width=True)
+                    st.image(data, caption=tag, width=200)
                     st.download_button(
                         "Download",
                         data=data,
@@ -1110,6 +1166,267 @@ def page_wolt_export():
 
 
 # ─────────────────────────────────────────────
+#  PAGE: PRODUCT PAGE EXTRACTOR
+# ─────────────────────────────────────────────
+
+def _extract_product_from_html(html: str, base_url: str = ""):
+    """Pull (image_url, name, description) from a product page's HTML.
+
+    Strategy: JSON-LD Product schema → Open Graph → DOM fallbacks.
+    """
+    import json
+    import re as _re
+    import unicodedata
+    from urllib.parse import urljoin, urlparse
+    from bs4 import BeautifulSoup
+
+    def _tokens(s: str):
+        """Lowercase, strip accents, split on non-alphanum. Drops short/stop tokens."""
+        if not s:
+            return set()
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        s = s.replace("æ", "ae").replace("Æ", "ae")
+        parts = _re.split(r"[^a-z0-9]+", s.lower())
+        STOP = {"the", "and", "for", "with", "of", "a", "an", "in", "on", "to", "g", "kg", "ml"}
+        return {p for p in parts if len(p) >= 3 and p not in STOP}
+
+    soup = BeautifulSoup(html, "html.parser")
+    name = ""
+    desc = ""
+    image = ""
+
+    # 1) JSON-LD schema.org/Product
+    for tag in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.string or "")
+        except Exception:
+            continue
+        candidates = data if isinstance(data, list) else [data]
+        # @graph wrapper (common on WP/Yoast)
+        if isinstance(data, dict) and "@graph" in data:
+            candidates = data["@graph"]
+        for c in candidates:
+            if not isinstance(c, dict):
+                continue
+            t = c.get("@type")
+            if t == "Product" or (isinstance(t, list) and "Product" in t):
+                name  = name  or (c.get("name") or "")
+                desc  = desc  or (c.get("description") or "")
+                img_v = c.get("image")
+                if isinstance(img_v, list):
+                    img_v = img_v[0] if img_v else ""
+                if isinstance(img_v, dict):
+                    img_v = img_v.get("url", "")
+                image = image or (img_v or "")
+
+    # 2) Open Graph
+    def _og(prop):
+        m = soup.find("meta", attrs={"property": prop})
+        return (m.get("content") or "").strip() if m else ""
+
+    name  = name  or _og("og:title")
+    desc  = desc  or _og("og:description")
+    image = image or _og("og:image")
+
+    # 3) DOM fallbacks
+    if not name:
+        h1 = soup.find("h1")
+        if h1:
+            name = h1.get_text(strip=True)
+    if not desc:
+        md = soup.find("meta", attrs={"name": "description"})
+        if md and md.get("content"):
+            desc = md["content"].strip()
+    if not desc:
+        # WooCommerce typical containers
+        for sel in [".woocommerce-product-details__short-description", "#tab-description", ".product-description"]:
+            el = soup.select_one(sel)
+            if el:
+                desc = el.get_text(" ", strip=True)
+                break
+
+    # Build a token set from the product name + URL slug so we can score
+    # generic images / paragraphs against the product when no semantic markup exists.
+    slug = ""
+    if base_url:
+        path = urlparse(base_url).path
+        slug = path.rstrip("/").rsplit("/", 1)[-1]
+    product_tokens = _tokens(name) | _tokens(slug)
+
+    if not image:
+        # WooCommerce gallery first
+        gallery = soup.select_one(".woocommerce-product-gallery__image")
+        if gallery:
+            a = gallery.find("a")
+            img = gallery.find("img")
+            if a and a.get("href"):
+                image = a["href"]
+            elif img:
+                image = img.get("data-large_image") or img.get("data-src") or img.get("src") or ""
+        if not image:
+            other = soup.select_one(".product-gallery img, .product-images img, .wp-post-image")
+            if other:
+                image = other.get("data-large_image") or other.get("data-src") or other.get("src") or ""
+
+    if not image and product_tokens:
+        # Generic scoring: pick the <img> whose alt+src share the most tokens with the product
+        BAD = ("logo", "icon", "favicon", "placeholder", "spacer", "tracker",
+               "facebook.com/tr", "google", "/symboli", "/glutenfree", "/monoproteico")
+        best = (0, "")
+        for img in soup.find_all("img"):
+            src = img.get("data-src") or img.get("data-original") or img.get("src") or ""
+            if not src or src.startswith("data:"):
+                continue
+            low = src.lower()
+            if any(b in low for b in BAD):
+                continue
+            haystack = (img.get("alt", "") + " " + src).lower()
+            score = sum(1 for t in product_tokens if t in haystack)
+            if score > best[0]:
+                best = (score, src)
+        if best[0] > 0:
+            image = best[1]
+
+    if not desc:
+        # Longest meaningful paragraph in the body, excluding nav/header/footer
+        candidates = []
+        for p in soup.find_all(["p", "div"]):
+            if p.find_parent(["nav", "header", "footer", "aside"]):
+                continue
+            cls = " ".join(p.get("class", []) or []).lower()
+            if any(b in cls for b in ("nav", "menu", "footer", "header", "cookie", "newsletter")):
+                continue
+            text = p.get_text(" ", strip=True)
+            if 80 <= len(text) <= 2000:
+                candidates.append(text)
+        if candidates:
+            desc = max(candidates, key=len)
+
+    if image and base_url:
+        image = urljoin(base_url, image)
+
+    return image, (name or "").strip(), (desc or "").strip()
+
+
+def page_product_extract():
+    import requests
+
+    st.title("Product Page Extractor")
+    st.caption("Paste a product URL, drop an .html file, or paste HTML — pull out the image, name and description.")
+
+    mode = st.radio(
+        "Source",
+        ["URL", "HTML file", "Paste HTML"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    html = ""
+    base_url = ""
+
+    if mode == "URL":
+        url = st.text_input("Product URL", placeholder="https://dudi-agencies.co.il/product/...")
+        if st.button("Fetch & extract", type="primary", use_container_width=True) and url:
+            try:
+                resp = requests.get(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; EmmaAgent/1.0)"},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                html = resp.text
+                base_url = url
+            except Exception as e:
+                st.error(f"Fetch failed: {e}")
+
+    elif mode == "HTML file":
+        uploaded = st.file_uploader("HTML file", type=["html", "htm"], label_visibility="collapsed")
+        if uploaded and st.button("Extract", type="primary", use_container_width=True):
+            html = uploaded.getvalue().decode("utf-8", errors="replace")
+
+    else:  # Paste HTML
+        pasted = st.text_area("Paste HTML", height=200, label_visibility="collapsed")
+        page_url = st.text_input("(Optional) source URL — used to resolve relative image links")
+        if st.button("Extract", type="primary", use_container_width=True) and pasted:
+            html = pasted
+            base_url = page_url
+
+    if html:
+        image_url, name, desc = _extract_product_from_html(html, base_url=base_url)
+        st.session_state["_prodext_result"] = {
+            "image_url": image_url,
+            "name": name,
+            "description": desc,
+        }
+        # Sync editable fields to the new extraction (passing value= alongside key= would be ignored on rerun)
+        st.session_state["_prodext_name"] = name
+        st.session_state["_prodext_desc"] = desc
+
+    result = st.session_state.get("_prodext_result")
+    if result:
+        st.markdown("---")
+        left, right = st.columns([1, 2])
+        with left:
+            if result["image_url"]:
+                st.image(result["image_url"], caption="Product image", width=240)
+                st.caption(result["image_url"])
+            else:
+                st.info("No image found.")
+        with right:
+            st.text_input("Name", key="_prodext_name")
+            st.text_area("Description", height=180, key="_prodext_desc")
+
+        if result["image_url"]:
+            try:
+                img_resp = requests.get(
+                    result["image_url"],
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; EmmaAgent/1.0)"},
+                    timeout=15,
+                )
+                if img_resp.ok:
+                    ext = result["image_url"].rsplit(".", 1)[-1].lower().split("?")[0]
+                    if ext not in ("jpg", "jpeg", "png", "webp"):
+                        ext = "jpg"
+                    safe_name = (st.session_state.get("_prodext_name") or "product").strip() or "product"
+                    fname = f"{safe_name}.{ext}"
+                    mime  = f"image/{ 'jpeg' if ext == 'jpg' else ext }"
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.download_button(
+                            "Download image",
+                            data=img_resp.content,
+                            file_name=fname,
+                            mime=mime,
+                            use_container_width=True,
+                        )
+                    with col_b:
+                        if st.button("Send to Image Processor →", type="primary", use_container_width=True):
+                            import io as _io
+                            from PIL import Image as _PIL
+                            ctype = img_resp.headers.get("content-type", "").lower()
+                            if "svg" in ctype or result["image_url"].lower().endswith(".svg"):
+                                st.error("Image is SVG, which can't be processed. Try a different product photo.")
+                            else:
+                                try:
+                                    _PIL.open(_io.BytesIO(img_resp.content)).verify()
+                                except Exception:
+                                    st.error(
+                                        f"The URL didn't return a usable image "
+                                        f"(content-type: {ctype or 'unknown'}). "
+                                        f"It may be a redirect, an HTML page, or an unsupported format."
+                                    )
+                                else:
+                                    queue = st.session_state.setdefault("_imgproc_external", [])
+                                    queue.append({"name": fname, "bytes": img_resp.content})
+                                    st.session_state.page = "image_processor"
+                                    st.rerun()
+            except Exception as e:
+                st.caption(f"(Image download unavailable: {e})")
+
+
+# ─────────────────────────────────────────────
 #  MOBILE BOTTOM NAV
 # ─────────────────────────────────────────────
 
@@ -1220,6 +1537,7 @@ pages = {
     "wolt":            page_wolt,
     "wolt_export":     page_wolt_export,
     "image_processor": page_image_processor,
+    "product_extract": page_product_extract,
 }
 
 pages[st.session_state.page]()

@@ -3,5 +3,6 @@ langchain-openai
 python-dotenv
 pydantic
 requests
+beautifulsoup4
 pandas
 openpyxl
