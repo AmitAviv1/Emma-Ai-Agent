@@ -38,6 +38,8 @@ SUPPLIER_PROFILES: dict = {
 
     "pet_pharm": {
         "display_name": "פט פארם בע\"מ",
+        "website": "https://www.pet-pharm.co.il",
+        "brands": [],
         "id_patterns": ["פט פארם", "PET-PHARM", "WWW.PET-PHARM", "514905801", "8122462"],
         "has_sku": False,
         "has_promo_rows": True,
@@ -59,6 +61,8 @@ The LINE TOTAL (סה"כ נטו) is the second column from the left.
 
     "beit_erez": {
         "display_name": "בית ארז חוות מילטין בע\"מ",
+        "website": "",
+        "brands": [],
         "id_patterns": ["בית ארז", "milatin-group", "511088106", "MILATIN", "לתאם אספקה"],
         "has_sku": True,
         "has_promo_rows": True,
@@ -81,6 +85,8 @@ The barcode is second from right — 13-digit EAN starting with 8682.
 
     "fish_and_pets": {
         "display_name": "פיש אנד פטס ישראל 1975 בע\"מ",
+        "website": "",
+        "brands": [],
         "id_patterns": ["פיש אנד פטס", "Fish & Pets", "fish@milatin", "510704406", "FISH & PETS"],
         "has_sku": True,
         "has_promo_rows": False,
@@ -103,6 +109,8 @@ The barcode is second from right — starts with * symbol, 13 digits inside.
 
     "osem": {
         "display_name": "אסם נסלה ישראל בע\"מ",
+        "website": "https://www.osem.co.il",
+        "brands": [],
         "id_patterns": ["אסם נסלה", "אסם", "OSEM", "9001600706", "9001596901", "IL557268760", "IL1326"],
         "has_sku": True,
         "has_promo_rows": True,
@@ -128,6 +136,8 @@ The LINE TOTAL = מחדר × כמות (multiply net unit price by quantity).
 
     "pets_pro": {
         "display_name": "פטס פרו רחובות",
+        "website": "https://petspro.co.il",
+        "brands": [],
         "id_patterns": ["פטס פרו", "petspro.co.il", "PET'S PRO", "021470471", "0524556663"],
         "has_sku": False,
         "has_promo_rows": True,
@@ -151,6 +161,8 @@ Row numbers (#) on the right are NOT SKUs — they are just sequential line numb
 
     "biopet": {
         "display_name": "ביופט בע\"מ",
+        "website": "",
+        "brands": [],
         "id_patterns": ["ביופט", "Biopet", "4023000", "1-800-602-030", "09-8984152", "SELF-84"],
         "has_sku": True,
         "has_promo_rows": False,
@@ -173,9 +185,11 @@ The barcode is second column from left — printed as a barcode image with numbe
 """,
     },
 
-    "tzama": {
-        "display_name": "צמה-ישראפט אגודה שיתופית חקלאית בע\"מ",
-        "id_patterns": ["צמה-ישראפט", "צמה ישראפט", "570060798", "IN260", "חיפה 3225", "04-6356538"],
+    "tzemach": {
+        "display_name": "צמח-ישראפט אגודה שיתופית חקלאית בע\"מ",
+        "website": "",
+        "brands": [],
+        "id_patterns": ["צמח-ישראפט", "צמח ישראפט", "570060798", "IN260", "חיפה 3225", "04-6356538"],
         "has_sku": True,
         "has_promo_rows": False,
         "cost_column": "סה\"כ",
@@ -197,6 +211,10 @@ Barcodes are wrapped in asterisks (*4250231595011*) — extract digits only, no 
 
     "dudi": {
         "display_name": "דודי סוכנויות",
+        "website": "https://dudi-agencies.co.il",
+        "brands": [
+            {"name": "Gosbi", "website": "https://gosbi.com"},
+        ],
         "id_patterns": ["דודי סוכנויות", "512171703", "dudi-agencies.co.il", "103805", "3056197"],
         "has_sku": True,
         "has_promo_rows": True,
@@ -220,6 +238,8 @@ The barcode is on the FAR LEFT of the barcode column — 13-digit EAN.
 
     "pet_care": {
         "display_name": "א.א פטקאר יבוא והפצה בע\"מ",
+        "website": "",
+        "brands": [],
         "id_patterns": ["פטקאר", "PET-CARE", "Pet-Care", "515379477", "i8691562"],
         "has_sku": True,
         "has_promo_rows": True,

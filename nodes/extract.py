@@ -272,7 +272,7 @@ def validate_extraction(
     for i, p in enumerate(extraction.products):
         label = f"Row {i+1} (bc={p.barcode or 'none'})"
 
-        # Clean barcode — strip whitespace, asterisks (tzama invoices use *barcode*)
+        # Clean barcode — strip whitespace, asterisks (tzemach invoices use *barcode*)
         bc = p.barcode.strip().strip("*")
         if bc != p.barcode:
             p = p.model_copy(update={"barcode": bc})
@@ -513,7 +513,7 @@ _SUPPLIER_BARCODE_PREFIXES: dict = {
     "pet_care":     ["0693493", "7265296", "0726529", "0788792", "8019808", "SKU-NT"],
     "beit_erez":    ["8682"],
     "fish_and_pets": ["8682"],
-    "tzama":        ["4250231"],
+    "tzemach":      ["4250231"],
     "dudi":         ["8430235"],
 }
 

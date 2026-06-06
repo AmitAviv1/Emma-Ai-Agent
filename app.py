@@ -159,21 +159,24 @@ with st.sidebar:
     st.markdown("---")
     nav_button("⌂  Home", "home")
     nav_button("📤  Upload", "upload")
-    pending_count = len([
-        b for b, d in st.session_state.decisions.items()
-        if d.get("decision") == "pending"
-    ]) or len(st.session_state.pending)
-    nav_button(
-        "🔍  Review",
-        "review",
-        badge=pending_count if pending_count > 0 and not st.session_state.saved else None,
-    )
-    nav_button("📋  Results", "results")
+    # Review / Results only appear while an invoice extraction is in progress
+    if st.session_state.products or st.session_state.page in ("review", "results"):
+        pending_count = len([
+            b for b, d in st.session_state.decisions.items()
+            if d.get("decision") == "pending"
+        ]) or len(st.session_state.pending)
+        nav_button(
+            "🔍  Review",
+            "review",
+            badge=pending_count if pending_count > 0 and not st.session_state.saved else None,
+        )
+        nav_button("📋  Results", "results")
     nav_button("📚  Catalog", "catalog")
     nav_button("🛒  Wolt Catalog", "wolt")
     nav_button("📦  Wolt Export", "wolt_export")
     nav_button("🖼️  Image Processor", "image_processor")
     nav_button("🔎  Product Extractor", "product_extract")
+    nav_button("🏢  Suppliers", "suppliers")
     st.markdown("---")
     st.caption("Logs")
     if st.session_state.log_lines:
@@ -1021,9 +1024,9 @@ def page_wolt_export():
     st.subheader("Product table")
 
     HEBREW_HEADERS = ["שם פריט", "מק״ט", "תיאור פריט", "מחיר פריט",
-                      "משקל פריט", "נפח פריט", "אחוזי אלכוהול", "הערות"]
+                      "משקל פריט", "נפח פריט", "הערות"]
     COL_KEYS       = ["שם פריט", "מק״ט", "תיאור פריט", "מחיר פריט",
-                      "משקל פריט", "נפח פריט", "אחוזי אלכוהול", "הערות"]
+                      "משקל פריט", "נפח פריט", "הערות"]
 
     # Pre-populate from session if available
     products = st.session_state.get("products", [])
@@ -1044,7 +1047,6 @@ def page_wolt_export():
                 "מחיר פריט":     p.get("wolt_price") or None,
                 "משקל פריט":     None,
                 "נפח פריט":      None,
-                "אחוזי אלכוהול": 0,
                 "הערות":         "",
             })
         df = pd.DataFrame(rows, columns=COL_KEYS)
@@ -1052,7 +1054,7 @@ def page_wolt_export():
         st.caption("No invoice loaded. Fill in the table manually or upload an invoice first.")
         df = pd.DataFrame(
             [{"שם פריט": "", "מק״ט": "", "תיאור פריט": "", "מחיר פריט": None,
-              "משקל פריט": None, "נפח פריט": None, "אחוזי אלכוהול": 0, "הערות": ""}],
+              "משקל פריט": None, "נפח פריט": None, "הערות": ""}],
             columns=COL_KEYS,
         )
 
@@ -1067,7 +1069,6 @@ def page_wolt_export():
             "מחיר פריט":     st.column_config.NumberColumn("מחיר פריט ₪", format="%.2f"),
             "משקל פריט":     st.column_config.NumberColumn("משקל (ג׳)", format="%.0f"),
             "נפח פריט":      st.column_config.NumberColumn("נפח (מ״ל)", format="%.0f"),
-            "אחוזי אלכוהול": st.column_config.NumberColumn("אלכוהול %", format="%.1f"),
             "הערות":         st.column_config.TextColumn("הערות"),
         },
         key="wolt_export_table",
@@ -1100,7 +1101,7 @@ def page_wolt_export():
                 cell = ws.cell(row=row_idx, column=col_idx, value=val if val is not None and val != "" else None)
                 cell.alignment = Alignment(horizontal="right")
 
-        col_widths = [35, 14, 30, 12, 12, 12, 12, 20]
+        col_widths = [35, 14, 30, 12, 12, 12, 20]
         for i, width in enumerate(col_widths, 1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
 
@@ -1326,7 +1327,25 @@ def page_product_extract():
     base_url = ""
 
     if mode == "URL":
-        url = st.text_input("Product URL", placeholder="https://dudi-agencies.co.il/product/...")
+        # Quick picker — supplier or one of their brand sites
+        merged = get_merged_suppliers()
+        quick_opts = [("—", "")]
+        for _, p in merged.items():
+            if p.get("website"):
+                quick_opts.append((f"{p['display_name']}", p["website"]))
+            for b in p.get("brands", []) or []:
+                if b.get("website"):
+                    quick_opts.append((f"{p['display_name']} → {b['name']}", b["website"]))
+
+        if len(quick_opts) > 1:
+            labels = [lbl for lbl, _ in quick_opts]
+            picked = st.selectbox("Quick start from supplier / brand (optional)", labels, index=0)
+            picked_url = dict(quick_opts).get(picked, "")
+            if picked != "—" and st.session_state.get("_prodext_supplier") != picked:
+                st.session_state["_prodext_supplier"] = picked
+                st.session_state["_prodext_url"] = picked_url
+
+        url = st.text_input("Product URL", key="_prodext_url", placeholder="https://dudi-agencies.co.il/product/...")
         if st.button("Fetch & extract", type="primary", use_container_width=True) and url:
             try:
                 resp = requests.get(
@@ -1427,6 +1446,212 @@ def page_product_extract():
 
 
 # ─────────────────────────────────────────────
+#  PAGE: SUPPLIERS DIRECTORY
+# ─────────────────────────────────────────────
+
+SUPPLIER_OVERRIDES_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "supplier_overrides.json"
+)
+
+
+def _load_supplier_overrides() -> dict:
+    import json
+    if not os.path.exists(SUPPLIER_OVERRIDES_PATH):
+        return {}
+    try:
+        with open(SUPPLIER_OVERRIDES_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_supplier_overrides(data: dict):
+    import json
+    with open(SUPPLIER_OVERRIDES_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_merged_suppliers() -> dict:
+    """Merge SUPPLIER_PROFILES defaults with the editable overrides JSON.
+    Overrides can edit `website`/`brands` for built-in suppliers,
+    or add entirely new suppliers via `_added: true` entries (display_name/website/brands only —
+    no invoice-extraction profile, so they won't auto-match on invoice header recognition)."""
+    from nodes.suppliers import SUPPLIER_PROFILES
+    overrides = _load_supplier_overrides()
+    merged = {}
+    for key, p in SUPPLIER_PROFILES.items():
+        m = dict(p)
+        ov = overrides.get(key, {})
+        if "website" in ov:
+            m["website"] = ov["website"]
+        if "brands" in ov:
+            m["brands"] = ov["brands"]
+        m.setdefault("brands", [])
+        merged[key] = m
+    # Append user-added suppliers (those in overrides but not in defaults)
+    for key, ov in overrides.items():
+        if key in merged:
+            continue
+        merged[key] = {
+            "display_name": ov.get("display_name", key),
+            "website":      ov.get("website", ""),
+            "brands":       ov.get("brands", []),
+            "id_patterns":  [],
+            "_added":       True,
+        }
+    return merged
+
+
+def _slugify_key(name: str) -> str:
+    import re as _re
+    import unicodedata
+    s = unicodedata.normalize("NFKD", name)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = _re.sub(r"[^a-zA-Z0-9]+", "_", s).strip("_").lower()
+    return s or "supplier"
+
+
+def page_suppliers():
+    import pandas as pd
+
+    st.title("Suppliers")
+    st.caption("Known suppliers and the brands they distribute. Edits persist to `supplier_overrides.json`.")
+
+    suppliers = get_merged_suppliers()
+
+    rows = []
+    for key, p in suppliers.items():
+        brand_str = ", ".join(b["name"] for b in p.get("brands", []) if b.get("name")) or "—"
+        rows.append({
+            "Name":    p["display_name"] + (" ✎" if p.get("_added") else ""),
+            "Website": p.get("website") or "",
+            "Brands":  brand_str,
+        })
+    df = pd.DataFrame(rows)
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Website": st.column_config.LinkColumn("Website"),
+            "Brands":  st.column_config.TextColumn("Brands", width="large"),
+        },
+    )
+
+    # ── Edit form ────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Edit supplier")
+
+    key_to_name = {k: p["display_name"] for k, p in suppliers.items()}
+    selected_key = st.selectbox(
+        "Supplier",
+        options=list(key_to_name.keys()),
+        format_func=lambda k: key_to_name[k],
+        key="_sup_edit_key",
+    )
+    cur = suppliers[selected_key]
+
+    website = st.text_input("Website", value=cur.get("website", ""), key=f"_sup_web_{selected_key}")
+
+    st.caption("Brands this supplier distributes")
+    brands_df = pd.DataFrame(cur.get("brands", []) or [], columns=["name", "website"])
+    if brands_df.empty:
+        brands_df = pd.DataFrame([{"name": "", "website": ""}])
+    edited_brands = st.data_editor(
+        brands_df,
+        use_container_width=True,
+        num_rows="dynamic",
+        column_config={
+            "name":    st.column_config.TextColumn("Brand name"),
+            "website": st.column_config.TextColumn("Brand website"),
+        },
+        key=f"_sup_brands_{selected_key}",
+    )
+
+    col_a, col_b, col_c = st.columns([1, 1, 4])
+    with col_a:
+        if st.button("Save", type="primary"):
+            overrides = _load_supplier_overrides()
+            cleaned_brands = [
+                {"name": str(r.get("name", "")).strip(), "website": str(r.get("website", "")).strip()}
+                for _, r in edited_brands.iterrows()
+                if str(r.get("name", "")).strip()
+            ]
+            existing = overrides.get(selected_key, {})
+            existing["website"] = website.strip()
+            existing["brands"]  = cleaned_brands
+            # User-added suppliers keep their display_name + _added marker
+            if cur.get("_added"):
+                existing["display_name"] = cur["display_name"]
+                existing["_added"] = True
+            overrides[selected_key] = existing
+            _save_supplier_overrides(overrides)
+            st.success(f"Saved {cur['display_name']}.")
+            st.rerun()
+    with col_b:
+        if cur.get("_added") and st.button("Delete", type="secondary"):
+            overrides = _load_supplier_overrides()
+            overrides.pop(selected_key, None)
+            _save_supplier_overrides(overrides)
+            st.success(f"Deleted {cur['display_name']}.")
+            st.rerun()
+    with col_c:
+        st.caption(f"Override file: `{os.path.basename(SUPPLIER_OVERRIDES_PATH)}`")
+
+    # ── Add new supplier ─────────────────────────────────────────────────
+    st.markdown("---")
+    with st.expander("➕ Add new supplier"):
+        st.caption(
+            "User-added suppliers appear in the directory and Product Extractor picker, "
+            "but won't be auto-recognized in invoice extraction "
+            "(that requires editing `nodes/suppliers.py`)."
+        )
+        new_name = st.text_input("Display name", key="_sup_new_name", placeholder="e.g. ACME Pet Distributors")
+        new_website = st.text_input("Website", key="_sup_new_website", placeholder="https://...")
+
+        new_brands_df = pd.DataFrame([{"name": "", "website": ""}])
+        new_edited_brands = st.data_editor(
+            new_brands_df,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "name":    st.column_config.TextColumn("Brand name"),
+                "website": st.column_config.TextColumn("Brand website"),
+            },
+            key="_sup_new_brands",
+        )
+
+        if st.button("Add supplier", type="primary"):
+            name = (new_name or "").strip()
+            if not name:
+                st.error("Display name is required.")
+            else:
+                overrides = _load_supplier_overrides()
+                base_key = _slugify_key(name)
+                key = base_key
+                i = 2
+                # Avoid colliding with built-in keys or existing overrides
+                taken = set(suppliers.keys()) | set(overrides.keys())
+                while key in taken:
+                    key = f"{base_key}_{i}"
+                    i += 1
+                cleaned = [
+                    {"name": str(r.get("name", "")).strip(), "website": str(r.get("website", "")).strip()}
+                    for _, r in new_edited_brands.iterrows()
+                    if str(r.get("name", "")).strip()
+                ]
+                overrides[key] = {
+                    "display_name": name,
+                    "website": (new_website or "").strip(),
+                    "brands":  cleaned,
+                    "_added":  True,
+                }
+                _save_supplier_overrides(overrides)
+                st.success(f"Added {name} (key: `{key}`).")
+                st.rerun()
+
+
+# ─────────────────────────────────────────────
 #  MOBILE BOTTOM NAV
 # ─────────────────────────────────────────────
 
@@ -1444,10 +1669,13 @@ def mobile_bottom_nav():
     items = [
         (SVG["home"],    "Home",    "home",            "Home"),
         (SVG["upload"],  "Upload",  "upload",          "Upload"),
-        (SVG["review"],  "Review",  "review",          "Review"),
-        (SVG["results"], "Results", "results",         "Results"),
-        (SVG["images"],  "Images",  "image_processor", "Image"),
     ]
+    if st.session_state.products or current in ("review", "results"):
+        items += [
+            (SVG["review"],  "Review",  "review",  "Review"),
+            (SVG["results"], "Results", "results", "Results"),
+        ]
+    items.append((SVG["images"], "Images", "image_processor", "Image"))
 
     nav_items_html = ""
     for svg, label, page, sidebar_text in items:
@@ -1538,6 +1766,7 @@ pages = {
     "wolt_export":     page_wolt_export,
     "image_processor": page_image_processor,
     "product_extract": page_product_extract,
+    "suppliers":       page_suppliers,
 }
 
 pages[st.session_state.page]()
