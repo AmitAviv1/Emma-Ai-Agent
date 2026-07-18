@@ -1,8 +1,34 @@
-langgraph
-langchain-openai
-python-dotenv
-pydantic
-requests
-beautifulsoup4
-pandas
-openpyxl
+# Emma — Streamlit deploy dependencies (pinned to the working local env).
+# Deploy on Streamlit Community Cloud with Python 3.12 to match these.
+
+streamlit==1.55.0
+
+# LLM / agent stack
+langgraph==1.0.10
+langchain-core==1.2.19
+langchain-openai==1.1.10
+langchain-anthropic==1.4.0
+langchain-google-genai==4.2.1
+
+# Core utils
+python-dotenv==1.0.1
+pydantic==2.10.2
+requests==2.32.3
+beautifulsoup4==4.12.3
+pandas==2.3.3
+openpyxl==3.1.5
+numpy==2.3.5
+
+# PDF / image handling
+pillow==12.1.1
+PyMuPDF==1.27.2
+pdfplumber==0.11.9
+
+# Google Sheets persistence (lazy-loaded; only used when saving invoices)
+gspread==6.2.1
+google-auth==2.49.1
+
+# NOTE: background removal (rembg / onnxruntime) is intentionally omitted —
+# it's heavy and can exceed the free-tier memory limit. The catalog and
+# invoice pages work without it; add `rembg` here if you need the Image
+# Processor's background removal on the cloud.
