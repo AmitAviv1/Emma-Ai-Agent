@@ -209,8 +209,8 @@ with st.sidebar:
             badge=pending_count if pending_count > 0 and not st.session_state.saved else None,
         )
         nav_button("📋  Results", "results")
-    nav_button("📚  Catalog", "catalog")
-    nav_button("🛒  Wolt Catalog", "wolt")
+    nav_button("📚  Invoice Catalog", "catalog")
+    nav_button("🛒  Catalog", "wolt")
     nav_button("📦  Wolt Export", "wolt_export")
     nav_button("🖼️  Image Processor", "image_processor")
     nav_button("🔎  Product Extractor", "product_extract")
@@ -654,7 +654,7 @@ def page_results():
 # ─────────────────────────────────────────────
 
 def page_catalog():
-    st.title("Product catalog")
+    st.title("Invoice Catalog")
     st.caption("All known products locked into the agent. New approvals are added here automatically.")
 
     try:
@@ -709,6 +709,23 @@ def page_wolt():
         '<p style="color:#888;margin-top:2px">מחיר וולט · מחיר חנות · מחיר קנייה</p>',
         unsafe_allow_html=True,
     )
+    # Mobile: show the product grid 2-per-row (instead of 1) by wrapping columns.
+    # Scoped to this page — the <style> is only emitted when the catalog renders.
+    st.markdown("""
+    <style>
+    @media (max-width: 768px) {
+        section[data-testid="stMain"] div[data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+            gap: 0.5rem !important;
+        }
+        section[data-testid="stMain"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+            flex: 1 1 calc(50% - 0.5rem) !important;
+            min-width: calc(50% - 0.5rem) !important;
+            width: calc(50% - 0.5rem) !important;
+        }
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
     try:
         from wolt_catalog import (
