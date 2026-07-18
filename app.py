@@ -659,106 +659,173 @@ def page_catalog():
 #  PAGE: WOLT CATALOG
 # ─────────────────────────────────────────────
 
-def page_wolt():
-    st.title("Wolt catalog")
-    st.caption("Upload your Wolt product export to enable sell price and margin matching.")
+def _save_buy_price(pid, key):
+    """on_change callback for a product's buy-price input."""
+    from wolt_catalog import set_buy_price
+    set_buy_price(pid, st.session_state.get(key, 0) or 0)
 
-    # ── Upload section ──────────────────────────────────────────────────
+
+def page_wolt():
+    st.markdown(
+        '<h1 style="margin-bottom:0">🛒 קטלוג החנות</h1>'
+        '<p style="color:#888;margin-top:2px">מחיר וולט · מחיר חנות · מחיר קנייה</p>',
+        unsafe_allow_html=True,
+    )
+
     try:
-        from wolt_catalog import is_loaded, load_catalog_from_bytes, reload_catalog, _catalog, FUZZY_THRESHOLD
+        from wolt_catalog import (
+            is_loaded, all_products, categories,
+            load_catalog_from_bytes, reload_catalog, FUZZY_THRESHOLD,
+        )
         loaded = is_loaded()
     except ImportError:
         st.error("wolt_catalog.py not found — make sure it's in your nodes/ folder.")
         return
 
-    if loaded:
-        from wolt_catalog import _catalog, _barcode_index, _sku_index
-        st.success(f"✅ Catalog loaded — {len(_catalog)} products "
-                   f"({len(_barcode_index)} with barcode, {len(_sku_index)} with SKU)")
-        if st.button("🔄 Reload from file"):
-            reload_catalog()
-            st.rerun()
-    else:
-        st.info("No catalog loaded yet. Upload your Wolt Excel export below.")
+    if not loaded:
+        st.info("עדיין לא נטען קטלוג. העלה קובץ Wolt/Emma בפאנל הניהול למטה.")
 
-    st.markdown("---")
+    # ── Catalog management (upload / reload / help) tucked away ───────────
+    with st.expander("⚙️  ניהול קטלוג  ·  Manage catalog"):
+        if loaded:
+            from wolt_catalog import _barcode_index, _sku_index, _catalog
+            st.success(f"✅ {len(_catalog)} מוצרים "
+                       f"({len(_barcode_index)} עם ברקוד, {len(_sku_index)} עם מק\"ט)")
+            if st.button("🔄 טען מחדש מהקובץ"):
+                reload_catalog()
+                st.rerun()
 
-    # File uploader
-    uploaded = st.file_uploader(
-        "Upload Wolt catalog (.xlsx)",
-        type=["xlsx"],
-        label_visibility="collapsed",
-    )
-    if uploaded:
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.info(f"**{uploaded.name}** — {uploaded.size // 1024} KB, {0} products")
-        with col2:
-            if st.button("Load catalog", type="primary", use_container_width=True):
-                with st.spinner("Loading…"):
+        uploaded = st.file_uploader("העלאת קטלוג (.xlsx)", type=["xlsx"],
+                                    label_visibility="collapsed")
+        if uploaded:
+            c1, c2 = st.columns([3, 1])
+            c1.info(f"**{uploaded.name}** — {uploaded.size // 1024} KB")
+            if c2.button("טען", type="primary", use_container_width=True):
+                with st.spinner("טוען…"):
                     ok = load_catalog_from_bytes(uploaded.read(), uploaded.name)
                 if ok:
-                    st.success("Catalog loaded!")
+                    st.success("נטען!")
                     st.rerun()
                 else:
-                    st.error("Failed to load — make sure it's a valid Wolt export with an 'offers' sheet.")
+                    st.error("טעינה נכשלה — ודא שזהו קובץ עם גיליון 'offers'.")
 
-    st.markdown("---")
+        st.caption(
+            f"מחיר חנות = מחיר וולט −27%, מעוגל כלפי מעלה.  "
+            f"התאמת חשבוניות: ברקוד → מק\"ט → שם ({int(FUZZY_THRESHOLD*100)}%+)."
+        )
 
-    # ── How matching works ───────────────────────────────────────────────
-    with st.expander("How matching works"):
-        st.markdown(f"""
-**Priority order when an invoice product is extracted:**
+    if not loaded:
+        return
 
-1. **Exact barcode match** — fastest and most accurate
-2. **Exact SKU match** — uses the `merchant_sku` column from your Wolt export
-3. **Fuzzy name match** — compares Hebrew product names with {int(FUZZY_THRESHOLD*100)}%+ similarity threshold
+    products = all_products()
 
-**After matching**, each product gets:
-- `wolt_price` — your sell price on Wolt
-- `margin_pct` — `(sell - unit_cost) / sell × 100`
-- `match_method` — how it was matched (`barcode`, `sku`, `name_fuzzy`, or `none`)
+    # ── Filter toolbar ───────────────────────────────────────────────────
+    max_price = int(max((p.sell_price for p in products), default=0)) + 1
+    f1, f2, f3 = st.columns([3, 2, 2])
+    search = f1.text_input("חיפוש", placeholder="חפש לפי שם, ברקוד או מק\"ט…",
+                           label_visibility="collapsed")
+    cat_options = ["כל הקטגוריות"] + categories()
+    chosen_cat = f2.selectbox("קטגוריה", cat_options, label_visibility="collapsed")
+    PRICE_VIEWS = ["כל המחירים", "מחיר וולט", "מחיר חנות", "מחיר קנייה"]
+    price_view = f3.selectbox("תצוגת מחיר", PRICE_VIEWS, label_visibility="collapsed")
 
-**To improve matching:**
-- Add barcodes to your Wolt products (edit in Wolt dashboard → Product → GTIN field)
-- The more barcodes you add, the fewer name-fuzzy matches you'll need
+    f4, f5, f6 = st.columns([3, 2, 2])
+    price_lo, price_hi = f4.slider("טווח מחיר וולט (₪)", 0, max_price, (0, max_price))
+    status = f5.selectbox("סטטוס", ["הכל", "פעילים בלבד", "לא פעילים בלבד"],
+                          label_visibility="collapsed")
+    missing_buy = f6.toggle("ללא מחיר קנייה", value=False)
 
-**To update the catalog:**
-- Download a fresh export from Wolt dashboard → Catalog → Export
-- Upload it here — replaces the old one
-        """)
+    # ── Apply filters ────────────────────────────────────────────────────
+    s = search.lower().strip()
+    filtered = []
+    for p in products:
+        if s and s not in p.name.lower() and s not in p.barcode and s not in p.merchant_sku:
+            continue
+        if chosen_cat != "כל הקטגוריות" and p.category != chosen_cat:
+            continue
+        if not (price_lo <= p.sell_price <= price_hi):
+            continue
+        if status == "פעילים בלבד" and not p.enabled:
+            continue
+        if status == "לא פעילים בלבד" and p.enabled:
+            continue
+        if missing_buy and p.buy_price > 0:
+            continue
+        filtered.append(p)
 
-    # ── Browse catalog ───────────────────────────────────────────────────
-    if loaded:
-        st.subheader("Browse catalog")
-        from wolt_catalog import _catalog as cat
-        search = st.text_input("Search by name, barcode, or SKU",
-                               label_visibility="collapsed",
-                               placeholder="Search…")
+    # ── Pagination ───────────────────────────────────────────────────────
+    PER_PAGE = 24
+    COLS = 4
+    total = len(filtered)
+    pages = max(1, (total + PER_PAGE - 1) // PER_PAGE)
 
-        shown = 0
-        hcols = st.columns([4, 2, 1, 1, 1])
-        for col, label in zip(hcols, ["Name", "Barcode / SKU", "Price", "Enabled", "Match"]):
-            col.markdown(f"**{label}**")
-        st.markdown('<hr style="margin:4px 0">', unsafe_allow_html=True)
+    top = st.columns([3, 1])
+    top[0].caption(f"נמצאו **{total}** מוצרים")
+    page = top[1].number_input("עמוד", 1, pages, 1, label_visibility="collapsed") if pages > 1 else 1
+    start = (page - 1) * PER_PAGE
+    page_items = filtered[start:start + PER_PAGE]
 
-        for p in cat:
-            if search:
-                s = search.lower()
-                if s not in p.name.lower() and s not in p.barcode and s not in p.merchant_sku:
-                    continue
-            row = st.columns([4, 2, 1, 1, 1])
-            row[0].write(p.name[:55] + ("…" if len(p.name) > 55 else ""))
-            id_str = p.barcode or p.merchant_sku or "—"
-            row[1].code(id_str[:18], language=None)
-            row[2].write(f"₪{p.sell_price:.0f}")
-            row[3].write("✓" if p.enabled else "✗")
-            method = "bc" if p.barcode else ("sku" if p.merchant_sku else "name")
-            row[4].write(method)
-            shown += 1
-            if shown >= 200:
-                st.caption("Showing first 200 results — refine your search to see more.")
-                break
+    if not page_items:
+        st.info("לא נמצאו מוצרים התואמים את הסינון.")
+        return
+
+    # ── Product grid ─────────────────────────────────────────────────────
+    for i in range(0, len(page_items), COLS):
+        cols = st.columns(COLS)
+        for col, p in zip(cols, page_items[i:i + COLS]):
+            with col, st.container(border=True):
+                if p.image_url:
+                    st.image(p.thumb(300), use_container_width=True)
+                else:
+                    st.markdown("<div style='height:120px;text-align:center;"
+                                "line-height:120px;color:#bbb'>🐾 אין תמונה</div>",
+                                unsafe_allow_html=True)
+
+                name = p.name if len(p.name) <= 60 else p.name[:58] + "…"
+                st.markdown(f"**{name}**")
+                chip = p.category + (f" · {p.subcategory}" if p.subcategory else "")
+                st.caption(chip or "ללא קטגוריה")
+                if not p.enabled:
+                    st.caption("⚠️ לא פעיל")
+
+                # ── Prices (🟦 Wolt / 🟩 Store / 🟨 Buy) — filtered by dropdown ──
+                buy_txt = f"₪{p.buy_price:.0f}" if p.buy_price > 0 else "—"
+                lines = []
+                if price_view in ("כל המחירים", "מחיר וולט"):
+                    lines.append(f"🟦 וולט <b>₪{p.sell_price:.0f}</b>")
+                if price_view in ("כל המחירים", "מחיר חנות"):
+                    lines.append(f"🟩 חנות <b>₪{p.store_price}</b>")
+                if price_view in ("כל המחירים", "מחיר קנייה"):
+                    lines.append(f"🟨 קנייה <b>{buy_txt}</b>")
+                st.markdown(
+                    "<div style='font-size:0.9em;line-height:1.6'>"
+                    + "<br>".join(lines) + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # ── Action icons: ✏️ edit buy price · 📄 description ──
+                a1, a2 = st.columns(2)
+                buy_key = f"buy_{p.wolt_id}"
+                with a1.popover("✏️", help="ערוך מחיר קנייה"):
+                    st.number_input(
+                        "מחיר קנייה ₪", min_value=0.0, step=0.5,
+                        value=float(p.buy_price), key=buy_key,
+                        on_change=_save_buy_price, args=(p.wolt_id, buy_key),
+                    )
+                with a2.popover("📄", help="תיאור ופרטים"):
+                    st.markdown(f"**{p.name}**")
+                    st.write(p.description if p.description else "_אין תיאור_")
+                    meta = []
+                    if p.weight_in_grams: meta.append(f"משקל: {p.weight_in_grams:.0f} גרם")
+                    if p.volume_in_ml:    meta.append(f"נפח: {p.volume_in_ml:.0f} מ\"ל")
+                    if p.number_of_units: meta.append(f"יחידות: {p.number_of_units:.0f}")
+                    if p.barcode:         meta.append(f"ברקוד: {p.barcode}")
+                    if p.merchant_sku:    meta.append(f"מק\"ט: {p.merchant_sku}")
+                    if meta:
+                        st.caption("  ·  ".join(meta))
+                    if p.buy_price > 0 and p.store_price:
+                        margin = (p.store_price - p.buy_price) / p.store_price * 100
+                        st.caption(f"רווח בחנות: {margin:.0f}%")
 
 
 # ─────────────────────────────────────────────
@@ -1318,7 +1385,7 @@ def page_product_extract():
 
     mode = st.radio(
         "Source",
-        ["URL", "HTML file", "Paste HTML"],
+        ["URL", "Search", "HTML file", "Paste HTML"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -1358,6 +1425,111 @@ def page_product_extract():
                 base_url = url
             except Exception as e:
                 st.error(f"Fetch failed: {e}")
+
+    elif mode == "Search":
+        from urllib.parse import urljoin, urlencode
+        from bs4 import BeautifulSoup
+
+        merged = get_merged_suppliers()
+        site_opts = [("—", "")]
+        for _, p in merged.items():
+            if p.get("website"):
+                site_opts.append((p["display_name"], p["website"]))
+            for b in p.get("brands", []) or []:
+                if b.get("website"):
+                    site_opts.append((f"{p['display_name']} → {b['name']}", b["website"]))
+
+        if len(site_opts) < 2:
+            st.info("Add a supplier with a website on the Suppliers page first.")
+        else:
+            labels = [lbl for lbl, _ in site_opts]
+            picked = st.selectbox("Site to search", labels, index=0)
+            site_url = dict(site_opts).get(picked, "")
+            query = st.text_input("Barcode or product name", placeholder="e.g. 'gosbi puppy' or 8430235681255")
+            st.caption("Most sites only index product names (not barcodes) for search.")
+
+            if st.button("Search", type="primary", use_container_width=True) and site_url and query:
+                search_url = urljoin(site_url, "/?" + urlencode({"s": query, "post_type": "product"}))
+                try:
+                    r = requests.get(
+                        search_url,
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; EmmaAgent/1.0)"},
+                        timeout=15,
+                    )
+                    r.raise_for_status()
+                    soup = BeautifulSoup(r.text, "html.parser")
+
+                    results = []
+                    seen = set()
+                    for a in soup.find_all("a", href=True):
+                        href = urljoin(site_url, a["href"])
+                        low = href.lower()
+                        if "/product/" not in low and "/products/" not in low:
+                            continue
+                        if href in seen:
+                            continue
+                        seen.add(href)
+                        # Find a meaningful image in the result card by walking up the DOM
+                        img_tag = None
+                        parent = a
+                        for _ in range(4):
+                            if parent is None:
+                                break
+                            cand = parent.find("img")
+                            if cand:
+                                src = (cand.get("data-src") or cand.get("src") or "").lower()
+                                if src and "logo" not in src and "icon" not in src and not src.startswith("data:"):
+                                    img_tag = cand
+                                    break
+                            parent = parent.parent
+                        title = a.get_text(" ", strip=True) or (img_tag.get("alt", "") if img_tag else "")
+                        img_src = ""
+                        if img_tag:
+                            img_src = img_tag.get("data-src") or img_tag.get("src") or ""
+                            if img_src:
+                                img_src = urljoin(site_url, img_src)
+                        results.append({"url": href, "title": title.strip(), "image": img_src})
+                        if len(results) >= 24:
+                            break
+
+                    st.session_state["_prodext_search_results"] = results
+                    st.session_state["_prodext_search_meta"] = {"site": picked, "query": query}
+                except Exception as e:
+                    st.error(f"Search failed: {e}")
+
+            results = st.session_state.get("_prodext_search_results", [])
+            meta = st.session_state.get("_prodext_search_meta", {})
+            if results:
+                st.markdown("---")
+                st.caption(f"{len(results)} result(s) on {meta.get('site','')} for '{meta.get('query','')}'.")
+                cols = st.columns(3)
+                for i, rr in enumerate(results):
+                    with cols[i % 3]:
+                        if rr["image"]:
+                            st.image(rr["image"], width=180)
+                        st.caption((rr["title"] or "(no title)")[:80])
+                        if st.button("Extract", key=f"_sext_{i}", use_container_width=True):
+                            try:
+                                page = requests.get(
+                                    rr["url"],
+                                    headers={"User-Agent": "Mozilla/5.0 (compatible; EmmaAgent/1.0)"},
+                                    timeout=15,
+                                )
+                                page.raise_for_status()
+                                image_url, name, desc = _extract_product_from_html(page.text, base_url=rr["url"])
+                                st.session_state["_prodext_result"] = {
+                                    "image_url": image_url, "name": name, "description": desc,
+                                }
+                                st.session_state["_prodext_name"] = name
+                                st.session_state["_prodext_desc"] = desc
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Fetch failed: {e}")
+            elif st.session_state.get("_prodext_search_meta"):
+                st.info(
+                    f"No products found on {meta.get('site','')} for '{meta.get('query','')}'. "
+                    "Try a product-name keyword (most sites don't index barcodes)."
+                )
 
     elif mode == "HTML file":
         uploaded = st.file_uploader("HTML file", type=["html", "htm"], label_visibility="collapsed")
@@ -1538,65 +1710,63 @@ def page_suppliers():
         },
     )
 
-    # ── Edit form ────────────────────────────────────────────────────────
+    # ── Edit supplier ────────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("Edit supplier")
+    with st.expander("✏️ Edit supplier"):
+        key_to_name = {k: p["display_name"] for k, p in suppliers.items()}
+        selected_key = st.selectbox(
+            "Supplier",
+            options=list(key_to_name.keys()),
+            format_func=lambda k: key_to_name[k],
+            key="_sup_edit_key",
+        )
+        cur = suppliers[selected_key]
 
-    key_to_name = {k: p["display_name"] for k, p in suppliers.items()}
-    selected_key = st.selectbox(
-        "Supplier",
-        options=list(key_to_name.keys()),
-        format_func=lambda k: key_to_name[k],
-        key="_sup_edit_key",
-    )
-    cur = suppliers[selected_key]
+        website = st.text_input("Website", value=cur.get("website", ""), key=f"_sup_web_{selected_key}")
 
-    website = st.text_input("Website", value=cur.get("website", ""), key=f"_sup_web_{selected_key}")
+        st.caption("Brands this supplier distributes")
+        brands_df = pd.DataFrame(cur.get("brands", []) or [], columns=["name", "website"])
+        if brands_df.empty:
+            brands_df = pd.DataFrame([{"name": "", "website": ""}])
+        edited_brands = st.data_editor(
+            brands_df,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "name":    st.column_config.TextColumn("Brand name"),
+                "website": st.column_config.TextColumn("Brand website"),
+            },
+            key=f"_sup_brands_{selected_key}",
+        )
 
-    st.caption("Brands this supplier distributes")
-    brands_df = pd.DataFrame(cur.get("brands", []) or [], columns=["name", "website"])
-    if brands_df.empty:
-        brands_df = pd.DataFrame([{"name": "", "website": ""}])
-    edited_brands = st.data_editor(
-        brands_df,
-        use_container_width=True,
-        num_rows="dynamic",
-        column_config={
-            "name":    st.column_config.TextColumn("Brand name"),
-            "website": st.column_config.TextColumn("Brand website"),
-        },
-        key=f"_sup_brands_{selected_key}",
-    )
-
-    col_a, col_b, col_c = st.columns([1, 1, 4])
-    with col_a:
-        if st.button("Save", type="primary"):
-            overrides = _load_supplier_overrides()
-            cleaned_brands = [
-                {"name": str(r.get("name", "")).strip(), "website": str(r.get("website", "")).strip()}
-                for _, r in edited_brands.iterrows()
-                if str(r.get("name", "")).strip()
-            ]
-            existing = overrides.get(selected_key, {})
-            existing["website"] = website.strip()
-            existing["brands"]  = cleaned_brands
-            # User-added suppliers keep their display_name + _added marker
-            if cur.get("_added"):
-                existing["display_name"] = cur["display_name"]
-                existing["_added"] = True
-            overrides[selected_key] = existing
-            _save_supplier_overrides(overrides)
-            st.success(f"Saved {cur['display_name']}.")
-            st.rerun()
-    with col_b:
-        if cur.get("_added") and st.button("Delete", type="secondary"):
-            overrides = _load_supplier_overrides()
-            overrides.pop(selected_key, None)
-            _save_supplier_overrides(overrides)
-            st.success(f"Deleted {cur['display_name']}.")
-            st.rerun()
-    with col_c:
-        st.caption(f"Override file: `{os.path.basename(SUPPLIER_OVERRIDES_PATH)}`")
+        col_a, col_b, col_c = st.columns([1, 1, 4])
+        with col_a:
+            if st.button("Save", type="primary"):
+                overrides = _load_supplier_overrides()
+                cleaned_brands = [
+                    {"name": str(r.get("name", "")).strip(), "website": str(r.get("website", "")).strip()}
+                    for _, r in edited_brands.iterrows()
+                    if str(r.get("name", "")).strip()
+                ]
+                existing = overrides.get(selected_key, {})
+                existing["website"] = website.strip()
+                existing["brands"]  = cleaned_brands
+                if cur.get("_added"):
+                    existing["display_name"] = cur["display_name"]
+                    existing["_added"] = True
+                overrides[selected_key] = existing
+                _save_supplier_overrides(overrides)
+                st.success(f"Saved {cur['display_name']}.")
+                st.rerun()
+        with col_b:
+            if cur.get("_added") and st.button("Delete", type="secondary"):
+                overrides = _load_supplier_overrides()
+                overrides.pop(selected_key, None)
+                _save_supplier_overrides(overrides)
+                st.success(f"Deleted {cur['display_name']}.")
+                st.rerun()
+        with col_c:
+            st.caption(f"Override file: `{os.path.basename(SUPPLIER_OVERRIDES_PATH)}`")
 
     # ── Add new supplier ─────────────────────────────────────────────────
     st.markdown("---")

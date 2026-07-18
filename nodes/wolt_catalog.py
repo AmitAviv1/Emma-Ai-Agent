@@ -20,6 +20,9 @@ MATCHING LOGIC (in priority order):
 
 import os
 import re
+import csv
+import json
+import math
 from difflib import SequenceMatcher
 from typing import Optional
 from dotenv import load_dotenv
@@ -39,36 +42,190 @@ WOLT_CATALOG_PATH = os.getenv(
 # 0.6 = fairly lenient, 0.75 = strict
 FUZZY_THRESHOLD = 0.62
 
+# ── Store-price formula: Wolt price −27%, rounded UP to the shekel ──
+STORE_DISCOUNT_1 = 0.27
+
+def compute_store_price(wolt_price: float) -> int:
+    if not wolt_price or wolt_price <= 0:
+        return 0
+    return math.ceil(wolt_price * (1 - STORE_DISCOUNT_1))
+
+# ── Sidecar data files ──
+_HERE          = os.path.dirname(os.path.abspath(__file__))
+_PROJECT       = os.path.dirname(_HERE)
+CATEGORIES_CSV = os.path.join(_PROJECT, "Wolt_Catalog", "categories.csv")
+PREV_XLSX      = os.path.join(_PROJECT, "Wolt_Catalog", "wolt_catalog.xlsx")  # previous export, for category recovery
+BUY_PRICES     = os.path.join(_PROJECT, "buy_prices.json")         # product_id -> buy price
+UNCATEGORIZED  = "ללא קטגוריה"
+
+
+def _load_json(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _load_category_lookup():
+    """Read categories.csv → (embedded_id → name, name → parent_name).
+    Categories come straight from the file's `category_id` column; no guessing."""
+    id_name, child_parent, rows = {}, {}, []
+    try:
+        with open(CATEGORIES_CSV, encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return id_name, child_parent
+    for r in rows:
+        id_name[r["id"].strip()] = (r.get("name") or "").strip()
+    for r in rows:
+        subs = (r.get("subcategories") or "").replace("\n", "").split(",")
+        for sub_id in subs:
+            sub_id = sub_id.strip()
+            if sub_id and sub_id in id_name:
+                child_parent[id_name[sub_id]] = (r.get("name") or "").strip()
+    return id_name, child_parent
+
+
+def _resolve_category(category_id, id_name, child_parent):
+    """Turn a raw `category_id` cell ("name::id" or "NO_CATEGORY::…") into
+    (category, subcategory) using categories.csv. Unknown → Uncategorized."""
+    if not category_id:
+        return UNCATEGORIZED, ""
+    embedded_id = str(category_id).split("::")[-1].strip()
+    name = id_name.get(embedded_id)
+    if not name:
+        return UNCATEGORIZED, ""
+    parent = child_parent.get(name)
+    if parent:
+        return parent, name          # leaf → top-level parent + subcategory
+    return name, ""
+
+
+def _load_prev_categories(id_name, child_parent):
+    """Recover categories from the PREVIOUS export (wolt_catalog.xlsx) for
+    products the current file left uncategorized. Returns dicts keyed by
+    product id / gtin / merchant_sku → (category, subcategory).
+    Categories a merchant has since removed (not in categories.csv) are kept
+    under their own name from the old file — this is real data, not a guess."""
+    from openpyxl import load_workbook
+    by_id, by_gtin, by_sku = {}, {}, {}
+    if not os.path.exists(PREV_XLSX):
+        return by_id, by_gtin, by_sku
+    wb = load_workbook(PREV_XLSX, read_only=True, data_only=True)
+    ws = wb["offers"]
+    rows = ws.iter_rows(values_only=True)
+    header = [str(h).strip() if h is not None else "" for h in next(rows)]
+    idx = {h: i for i, h in enumerate(header)}
+    ci, ii = idx.get("category_id"), idx.get("id")
+    gi, si = idx.get("gtin"), idx.get("merchant_sku")
+    if ci is None:
+        wb.close()
+        return by_id, by_gtin, by_sku
+    for row in rows:
+        if not row or not row[ci]:
+            continue
+        raw = str(row[ci])
+        if raw.startswith("NO_CATEGORY"):
+            continue
+        cat, sub = _resolve_category(raw, id_name, child_parent)
+        if cat == UNCATEGORIZED:
+            # a category no longer listed in categories.csv → use its old name
+            namepart = raw.split("::")[0].replace("_", " ").strip()
+            if not namepart:
+                continue
+            cat, sub = namepart, ""
+        pair = (cat, sub)
+        if ii is not None and row[ii]:
+            by_id[row[ii]] = pair
+        if gi is not None and row[gi]:
+            by_gtin[str(row[gi]).strip()] = pair
+        if si is not None and row[si]:
+            by_sku[str(row[si]).strip()] = pair
+    wb.close()
+    return by_id, by_gtin, by_sku
+
+
+def _load_buy_prices() -> dict:
+    return _load_json(BUY_PRICES)
+
+
+def _save_buy_prices(data: dict):
+    with open(BUY_PRICES, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 # ─────────────────────────────────────────────
 #  CATALOG STRUCTURE
 # ─────────────────────────────────────────────
 
-class WoltProduct:
-    """One product from the Wolt catalog."""
-    __slots__ = ("wolt_id", "barcode", "merchant_sku", "name",
-                 "sell_price", "enabled", "category", "image_url")
+def _to_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return True
+    return str(v).strip().lower() in ("1", "true", "yes", "כן")
 
-    def __init__(self, row: tuple):
-        self.wolt_id      = row[0] or ""
-        self.barcode      = str(row[1]).strip() if row[1] else ""
-        self.merchant_sku = str(row[2]).strip() if row[2] else ""
-        self.name         = row[3] or ""
-        self.sell_price   = float(row[5]) if row[5] else 0.0
-        self.enabled      = bool(row[16]) if len(row) > 16 else True
-        self.category     = str(row[18]).split("::")[0] if len(row) > 18 and row[18] else ""
-        self.image_url    = row[10] or ""
+
+def _to_float(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+class WoltProduct:
+    """One product from the Wolt/Emma catalog (built from a header→value dict)."""
+    __slots__ = ("wolt_id", "barcode", "merchant_sku", "name", "description",
+                 "sell_price", "store_price", "buy_price", "enabled",
+                 "category", "subcategory", "image_urls",
+                 "weight_in_grams", "volume_in_ml", "number_of_units")
+
+    def __init__(self, rec: dict):
+        # `rec` maps header name → cell value (robust to column reordering).
+        self.wolt_id      = rec.get("id") or ""
+        self.barcode      = str(rec.get("gtin")).strip() if rec.get("gtin") else ""
+        self.merchant_sku = str(rec.get("merchant_sku")).strip() if rec.get("merchant_sku") else ""
+        self.name         = rec.get("name") or ""
+        self.description  = rec.get("description") or ""
+        self.sell_price   = _to_float(rec.get("price"))
+        self.store_price  = compute_store_price(self.sell_price)
+        self.buy_price    = 0.0                      # filled from buy_prices.json by the loader
+        self.enabled      = _to_bool(rec.get("enabled"))
+        self.category     = ""                       # filled from the file's category_id by the loader
+        self.subcategory  = ""
+        images            = rec.get("images") or ""
+        self.image_urls   = [u.strip() for u in str(images).split(",") if u.strip()]
+        self.weight_in_grams = _to_float(rec.get("weight_in_grams"))
+        self.volume_in_ml    = _to_float(rec.get("volume_in_ml"))
+        self.number_of_units = _to_float(rec.get("number_of_units"))
+
+    @property
+    def image_url(self) -> str:
+        """First image (backwards-compatible with old single-image callers)."""
+        return self.image_urls[0] if self.image_urls else ""
+
+    def thumb(self, w: int = 300) -> str:
+        """Sized image URL via the Wolt image proxy (supports ?w=&h=)."""
+        u = self.image_url
+        if not u:
+            return ""
+        sep = "&" if "?" in u else "?"
+        return f"{u}{sep}w={w}"
 
     def to_dict(self) -> dict:
         return {
-            "wolt_id":      self.wolt_id,
-            "wolt_name":    self.name,
-            "wolt_price":   self.sell_price,
-            "wolt_enabled": self.enabled,
-            "wolt_barcode": self.barcode,
-            "wolt_sku":     self.merchant_sku,
-            "wolt_category":self.category,
-            "wolt_image":   self.image_url,
+            "wolt_id":        self.wolt_id,
+            "wolt_name":      self.name,
+            "wolt_price":     self.sell_price,
+            "store_price":    self.store_price,
+            "buy_price":      self.buy_price,
+            "wolt_enabled":   self.enabled,
+            "wolt_barcode":   self.barcode,
+            "wolt_sku":       self.merchant_sku,
+            "wolt_category":  self.category,
+            "wolt_subcategory": self.subcategory,
+            "wolt_image":     self.image_url,
         }
 
 
@@ -80,6 +237,8 @@ _catalog: Optional[list] = None           # list of WoltProduct
 _barcode_index: dict = {}                  # barcode → WoltProduct
 _sku_index: dict = {}                      # merchant_sku → WoltProduct
 _name_tokens: list = []                    # list of (normalized_name, WoltProduct)
+_id_index: dict = {}                        # wolt_id → WoltProduct
+_category_tree: list = []                   # ordered [(parent, [sub, ...]), ...] for filters
 
 
 def _normalize(text: str) -> str:
@@ -99,32 +258,88 @@ def _load_from_file(path: str) -> list:
     except ImportError:
         raise ImportError("pip install openpyxl")
 
-    wb = load_workbook(path, read_only=True)
+    wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb["offers"]
+    rows = ws.iter_rows(values_only=True)
+    header = [str(h).strip() if h is not None else "" for h in next(rows)]
+
+    id_name, child_parent = _load_category_lookup()
+    fb_id, fb_gtin, fb_sku = _load_prev_categories(id_name, child_parent)
+    buy_map = _load_buy_prices()
+
     products = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if not any(row):
+    for row in rows:
+        if not row or not any(row):
             continue
         try:
-            products.append(WoltProduct(row))
+            rec = dict(zip(header, row))
+            p = WoltProduct(rec)
+            # Category comes directly from the file's category_id column.
+            p.category, p.subcategory = _resolve_category(
+                rec.get("category_id"), id_name, child_parent)
+            # Fill gaps from the previous export (id → gtin → sku).
+            if p.category == UNCATEGORIZED:
+                pair = (fb_id.get(p.wolt_id)
+                        or (fb_gtin.get(p.barcode) if p.barcode else None)
+                        or (fb_sku.get(p.merchant_sku) if p.merchant_sku else None))
+                if pair:
+                    p.category, p.subcategory = pair
+            bp = buy_map.get(p.wolt_id)
+            if bp is not None:
+                p.buy_price = _to_float(bp)
+            products.append(p)
         except Exception:
             pass
     wb.close()
     return products
 
 
+def _load_category_tree() -> list:
+    """Ordered [(parent_name, [subcategory_name, ...]), ...] from categories.csv,
+    used to render the category filter grouped parent → sub."""
+    tree = []
+    id_name = {}
+    try:
+        with open(CATEGORIES_CSV, encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+    except Exception:
+        return tree
+    for r in rows:
+        id_name[r["id"].strip()] = (r.get("name") or "").strip()
+    child_ids = set()
+    for r in rows:
+        subs = [s.strip() for s in (r.get("subcategories") or "").replace("\n", "").split(",") if s.strip()]
+        if subs:
+            children = [id_name[s] for s in subs if s in id_name]
+            tree.append(((r.get("name") or "").strip(), children))
+            child_ids.update(subs)
+    # top-level categories that are not a parent-with-children and not a child
+    for r in rows:
+        cid = r["id"].strip()
+        name = (r.get("name") or "").strip()
+        is_parent = any(name == p for p, _ in tree)
+        if cid not in child_ids and not is_parent:
+            tree.append((name, []))
+    return tree
+
+
 def _build_indexes(products: list):
-    global _barcode_index, _sku_index, _name_tokens
+    global _barcode_index, _sku_index, _name_tokens, _id_index, _category_tree
     _barcode_index = {}
     _sku_index     = {}
     _name_tokens   = []
+    _id_index      = {}
 
     for p in products:
         if p.barcode:
             _barcode_index[p.barcode] = p
         if p.merchant_sku:
             _sku_index[p.merchant_sku] = p
+        if p.wolt_id:
+            _id_index[p.wolt_id] = p
         _name_tokens.append((_normalize(p.name), p))
+
+    _category_tree = _load_category_tree()
 
     print(f"📦 [WOLT] Catalog loaded: {len(products)} products "
           f"({len(_barcode_index)} with barcode, "
@@ -161,6 +376,58 @@ def is_loaded() -> bool:
 def _ensure_loaded():
     if not is_loaded():
         load_catalog()
+
+
+# ─────────────────────────────────────────────
+#  PUBLIC ACCESSORS (for the Streamlit shop catalog)
+# ─────────────────────────────────────────────
+
+def all_products() -> list:
+    """Return the loaded product list (empty list if not loaded)."""
+    _ensure_loaded()
+    return _catalog or []
+
+
+def category_tree() -> list:
+    """Ordered [(parent_name, [subcategory, ...]), ...] for the category filter."""
+    _ensure_loaded()
+    return _category_tree
+
+
+def categories() -> list:
+    """Flat, de-duplicated list of category names actually present in the catalog,
+    ordered by the category tree (parents first), with any extras appended."""
+    _ensure_loaded()
+    present = {p.category for p in (_catalog or []) if p.category}
+    ordered = []
+    for parent, subs in _category_tree:
+        if parent in present and parent not in ordered:
+            ordered.append(parent)
+    for c in sorted(present):
+        if c not in ordered:
+            ordered.append(c)
+    return ordered
+
+
+def set_buy_price(product_id: str, value) -> bool:
+    """Persist a buy price for a product and update the in-memory object."""
+    if not product_id:
+        return False
+    data = _load_buy_prices()
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return False
+    if val > 0:
+        data[product_id] = val
+    else:
+        data.pop(product_id, None)
+        val = 0.0
+    _save_buy_prices(data)
+    p = _id_index.get(product_id)
+    if p is not None:
+        p.buy_price = val
+    return True
 
 
 # ─────────────────────────────────────────────
