@@ -44,19 +44,54 @@ def _get_sheet_client():
             "Missing dependencies. Run: pip install gspread google-auth"
         )
 
-    creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not creds_path or not os.path.exists(creds_path):
-        raise FileNotFoundError(
-            "GOOGLE_SERVICE_ACCOUNT_JSON not set or file not found.\n"
-            "Set it in your .env: GOOGLE_SERVICE_ACCOUNT_JSON=/path/to/key.json"
-        )
-
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+
+    info = _load_service_account_info()
+    if info is None:
+        raise FileNotFoundError(
+            "No Google service-account credentials found.\n"
+            "  • Local: set GOOGLE_SERVICE_ACCOUNT_JSON in .env to the key file path.\n"
+            "  • Streamlit Cloud: add a [gcp_service_account] table in Secrets."
+        )
+
+    if isinstance(info, str):        # a file path
+        creds = Credentials.from_service_account_file(info, scopes=scopes)
+    else:                            # a dict from Secrets / raw JSON
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
     return gspread.authorize(creds)
+
+
+def _load_service_account_info():
+    """Resolve service-account credentials from (in priority order):
+      1. Streamlit Secrets  →  [gcp_service_account] table (cloud deploy)
+      2. GOOGLE_SERVICE_ACCOUNT_JSON holding raw JSON  (env/secret)
+      3. GOOGLE_SERVICE_ACCOUNT_JSON holding a file path  (local default)
+    Returns a dict, a path string, or None if nothing is configured."""
+    # 1) Streamlit Secrets (nested table isn't exported to os.environ)
+    try:
+        import streamlit as st
+        if "gcp_service_account" in st.secrets:
+            return dict(st.secrets["gcp_service_account"])
+    except Exception:
+        pass
+
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if not raw:
+        return None
+    # 2) Raw JSON blob
+    if raw.startswith("{"):
+        import json
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+    # 3) File path
+    if os.path.exists(raw):
+        return raw
+    return None
 
 
 def _get_or_create_sheet(client, sheet_id: str, tab_name: str, headers: list):
