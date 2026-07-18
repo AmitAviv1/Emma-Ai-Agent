@@ -10,6 +10,7 @@ Install:
 
 import os
 import sys
+import hmac
 import tempfile
 import streamlit as st
 import streamlit.components.v1 as components
@@ -95,6 +96,43 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+#  PASSWORD GATE
+# ─────────────────────────────────────────────
+#  Set APP_PASSWORD in .env (local) or Streamlit "Secrets" (cloud) to require
+#  a password. If it's not set, the app stays open (convenient for local dev).
+
+def _get_app_password() -> str:
+    try:
+        if "APP_PASSWORD" in st.secrets:
+            return str(st.secrets["APP_PASSWORD"])
+    except Exception:
+        pass
+    return os.getenv("APP_PASSWORD", "")
+
+
+def _require_login():
+    password = _get_app_password()
+    if not password:
+        return                       # no password configured → app is open
+    if st.session_state.get("_auth_ok"):
+        return
+
+    def _check():
+        entered = st.session_state.get("_pw_input", "")
+        st.session_state["_auth_ok"] = hmac.compare_digest(entered, password)
+        st.session_state.pop("_pw_input", None)
+
+    st.markdown("## 🔒 Emma — כניסה")
+    st.text_input("סיסמה", type="password", key="_pw_input", on_change=_check)
+    if st.session_state.get("_auth_ok") is False:
+        st.error("סיסמה שגויה, נסה שוב.")
+    st.stop()
+
+
+_require_login()
 
 
 # ─────────────────────────────────────────────
