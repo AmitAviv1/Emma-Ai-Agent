@@ -1078,7 +1078,7 @@ def page_home():
     st.caption("AI-powered invoice processing and product image automation.")
     st.markdown("---")
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         st.markdown("""
         <div style="border:1px solid #e0e0e0;border-radius:12px;padding:1.5rem 1rem;text-align:center;min-height:130px">
@@ -1098,6 +1098,23 @@ def page_home():
             st.rerun()
 
     with col2:
+        st.markdown("""
+        <div style="border:1px solid #e0e0e0;border-radius:12px;padding:1.5rem 1rem;text-align:center;min-height:130px">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="1.6"
+                 stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:8px">
+                <circle cx="9" cy="21" r="1"/>
+                <circle cx="20" cy="21" r="1"/>
+                <path d="M1 1h4l2.68 13.39a2 2 0 002 1.61h9.72a2 2 0 002-1.61L23 6H6"/>
+            </svg>
+            <p style="font-weight:600;margin:0 0 4px">Catalog</p>
+            <p style="font-size:0.8rem;color:#999;margin:0">Browse products, prices & categories</p>
+        </div>""", unsafe_allow_html=True)
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if st.button("Open", key="home_catalog", use_container_width=True):
+            st.session_state.page = "wolt"
+            st.rerun()
+
+    with col3:
         st.markdown("""
         <div style="border:1px solid #e0e0e0;border-radius:12px;padding:1.5rem 1rem;text-align:center;min-height:130px">
             <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#888" stroke-width="1.6"
