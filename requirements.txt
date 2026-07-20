@@ -28,9 +28,9 @@ pdfplumber==0.11.9
 gspread==6.2.1
 google-auth==2.49.1
 
-# Background removal for the Image Processor. Heavy (pulls in onnxruntime and
-# downloads a model on first use) — needs the system libs in packages.txt.
-# If it ever exceeds the free-tier memory, the app still runs: image
-# processing just falls back to "no background removal".
-rembg==2.0.73
-onnxruntime==1.24.3
+# NOTE: background removal (rembg / onnxruntime) is left OUT of the cloud
+# build — it broke the Streamlit free-tier deploy. The app degrades
+# gracefully: the Image Processor still formats images (resize/center) on the
+# cloud, just without background removal. Background removal works when you run
+# locally (rembg is installed there). To retry it on the cloud, re-add
+# `rembg` + `onnxruntime` here and recreate packages.txt (libgl1, libglib2.0-0).
