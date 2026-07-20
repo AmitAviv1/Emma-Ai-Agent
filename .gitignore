@@ -21,3 +21,7 @@ processed_images/
 temp_*.jpg
 temp_*.png
 *-key.json
+
+# Streamlit secrets — never commit
+.streamlit/secrets.toml
+*secrets*.toml

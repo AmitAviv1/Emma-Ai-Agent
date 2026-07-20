@@ -28,9 +28,9 @@ pdfplumber==0.11.9
 gspread==6.2.1
 google-auth==2.49.1
 
-# Background removal for the Image Processor. Heavy (pulls in onnxruntime and
-# downloads a model on first use) — needs the system libs in packages.txt.
-# If it ever exceeds the free-tier memory, the app still runs: image
-# processing just falls back to "no background removal".
+# Background removal for the Image Processor (needs the system libs in
+# packages.txt). onnxruntime is left unpinned so pip can pick a prebuilt wheel
+# for whatever Python the cloud uses. If it still fails to build, the app runs
+# anyway and falls back to "no background removal".
 rembg==2.0.73
-onnxruntime==1.24.3
+onnxruntime
