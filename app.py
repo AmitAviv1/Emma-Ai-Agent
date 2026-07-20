@@ -289,6 +289,78 @@ def run_extraction(pdf_path: str):
     add_log(f"Auto-approved {len(validation['approved'])}, pending review: {len(validation['pending_review'])}")
 
 
+# ─────────────────────────────────────────────
+#  INVOICE QUEUE (upload several, process one at a time)
+# ─────────────────────────────────────────────
+
+def _process_queued_invoice(idx: int) -> bool:
+    """Extract the queued invoice at `idx` into session state. Returns True on
+    success. Navigation is left to the caller."""
+    queue = st.session_state.get("_invoice_queue", [])
+    if idx < 0 or idx >= len(queue):
+        return False
+    item = queue[idx]
+    suffix = f".{item['ext']}"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(item["bytes"])
+        tmp_path = tmp.name
+    st.session_state._extract_error = False
+    try:
+        run_extraction(tmp_path)
+    except Exception as e:
+        st.session_state._extract_error = True
+        st.error(f"Extraction failed for {item['name']}: {e}")
+        add_log(f"❌ Extraction error ({item['name']}): {e}")
+        import traceback
+        add_log(traceback.format_exc())
+        return False
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+    st.session_state._invoice_queue_idx = idx
+    return True
+
+
+def _goto_after_extraction():
+    """Route to review (if items need review) or results."""
+    if st.session_state.products:
+        st.session_state.page = "review" if st.session_state.pending else "results"
+        st.rerun()
+
+
+def _advance_invoice_queue():
+    """Move to the next queued invoice; clears the queue when finished."""
+    queue = st.session_state.get("_invoice_queue", [])
+    nxt = st.session_state.get("_invoice_queue_idx", 0) + 1
+    if nxt >= len(queue):
+        st.session_state._invoice_queue = []
+        st.session_state._invoice_queue_idx = 0
+        st.session_state.page = "upload"
+        st.rerun()
+        return
+    # Advance the pointer first so a failing invoice can be skipped, not retried.
+    st.session_state._invoice_queue_idx = nxt
+    if _process_queued_invoice(nxt):
+        _goto_after_extraction()
+    else:
+        st.rerun()
+
+
+def _queue_status_banner():
+    """Show 'Invoice X of N' + a Next button when a queue is active."""
+    queue = st.session_state.get("_invoice_queue", [])
+    if len(queue) <= 1:
+        return
+    idx = st.session_state.get("_invoice_queue_idx", 0)
+    remaining = len(queue) - idx - 1
+    cols = st.columns([3, 1])
+    cols[0].info(f"📚 Invoice **{idx + 1} of {len(queue)}** — {queue[idx]['name']}"
+                 + (f"  ·  {remaining} left in queue" if remaining else "  ·  last one"))
+    label = "Next invoice →" if remaining else "Finish ✓"
+    if cols[1].button(label, use_container_width=True, key="_queue_next"):
+        _advance_invoice_queue()
+
+
 def save_to_sheets():
     """Writes approved products to Google Sheets."""
     from storage import (
@@ -359,45 +431,34 @@ def save_to_sheets():
 # ─────────────────────────────────────────────
 
 def page_upload():
-    st.title("Upload invoice")
+    st.title("Upload invoices")
 
-    uploaded = st.file_uploader(
-        "Drop a PDF invoice or image here",
+    uploaded_files = st.file_uploader(
+        "Drop one or more PDF invoices or images here",
         type=["pdf", "jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
         label_visibility="collapsed",
     )
 
-    if uploaded:
-        ext = uploaded.name.rsplit(".", 1)[-1].lower()
-        suffix = f".{ext}"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(uploaded.read())
-            tmp_path = tmp.name
+    if uploaded_files:
+        st.caption(f"**{len(uploaded_files)}** file(s) selected:")
+        for f in uploaded_files:
+            st.write(f"• {f.name} — {f.size // 1024} KB")
 
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.info(f"**{uploaded.name}** — {uploaded.size // 1024} KB")
-            if ext in ("jpg", "jpeg", "png", "webp"):
-                st.image(uploaded, width=400)
-        with col2:
-            if st.button("Process invoice", type="primary", use_container_width=True):
-                try:
-                    run_extraction(tmp_path)
-                except Exception as e:
-                    st.error(f"Extraction failed: {e}")
-                    add_log(f"❌ Extraction error: {e}")
-                    import traceback
-                    add_log(traceback.format_exc())
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-
+        n = len(uploaded_files)
+        btn_label = "Process invoice" if n == 1 else f"Process {n} invoices (one at a time)"
+        if st.button(btn_label, type="primary", use_container_width=True):
+            # Snapshot bytes now — the uploader widget resets across reruns.
+            st.session_state._invoice_queue = [
+                {"name": f.name,
+                 "ext": f.name.rsplit(".", 1)[-1].lower(),
+                 "bytes": f.getvalue()}
+                for f in uploaded_files
+            ]
+            st.session_state._invoice_queue_idx = 0
+            if _process_queued_invoice(0):
                 if st.session_state.products:
-                    if st.session_state.pending:
-                        st.session_state.page = "review"
-                    else:
-                        st.session_state.page = "results"
-                    st.rerun()
+                    _goto_after_extraction()
                 elif not st.session_state.get("_extract_error"):
                     st.warning("No products were extracted. Check the logs in the sidebar.")
 
@@ -419,6 +480,7 @@ def page_upload():
 
 def page_review():
     st.title("Review unknown products")
+    _queue_status_banner()
 
     pending = st.session_state.pending
     if not pending:
@@ -526,6 +588,7 @@ def page_review():
 
 def page_results():
     st.title("Extraction results")
+    _queue_status_banner()
 
     products = st.session_state.products
     if not products:
@@ -663,24 +726,44 @@ def page_catalog():
         st.error("Could not load PRODUCT_CATALOG from extract.py")
         return
 
+    # Enrich with the shop catalog so we can show each product's buy price.
+    try:
+        from wolt_catalog import match_product
+    except ImportError:
+        match_product = None
+
     search = st.text_input("Search catalog", placeholder="Name or barcode…",
                            label_visibility="collapsed")
 
     st.markdown(f"**{len(PRODUCT_CATALOG)} products** in catalog")
     st.markdown("---")
 
-    hcols = st.columns([2, 5])
+    hcols = st.columns([2, 4, 1.4])
     hcols[0].markdown("**Barcode**")
     hcols[1].markdown("**Product name**")
+    hcols[2].markdown("**Buy price ₪**")
     st.markdown('<hr style="margin:4px 0">', unsafe_allow_html=True)
 
     shown = 0
     for bc, name in PRODUCT_CATALOG.items():
         if search and search.lower() not in name.lower() and search not in bc:
             continue
-        row = st.columns([2, 5])
+        row = st.columns([2, 4, 1.4])
         row[0].code(bc, language=None)
         row[1].write(name)
+
+        # Look the product up in the shop catalog (by barcode/SKU) → buy price.
+        wolt = match_product(barcode=str(bc)) if match_product else None
+        if wolt and wolt.get("wolt_id"):
+            key = f"invbuy_{bc}"
+            row[2].number_input(
+                "Buy price", min_value=0.0, step=0.5,
+                value=float(wolt.get("buy_price") or 0),
+                key=key, on_change=_save_buy_price, args=(wolt["wolt_id"], key),
+                label_visibility="collapsed",
+            )
+        else:
+            row[2].caption("—")
         shown += 1
 
     if shown == 0:
