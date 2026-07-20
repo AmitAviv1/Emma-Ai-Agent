@@ -347,7 +347,7 @@ def _advance_invoice_queue():
 
 
 def _queue_status_banner():
-    """Show 'Invoice X of N' + a Next button when a queue is active."""
+    """Show 'Invoice X of N' progress (+ a Skip button) when a queue is active."""
     queue = st.session_state.get("_invoice_queue", [])
     if len(queue) <= 1:
         return
@@ -356,9 +356,27 @@ def _queue_status_banner():
     cols = st.columns([3, 1])
     cols[0].info(f"📚 Invoice **{idx + 1} of {len(queue)}** — {queue[idx]['name']}"
                  + (f"  ·  {remaining} left in queue" if remaining else "  ·  last one"))
-    label = "Next invoice →" if remaining else "Finish ✓"
-    if cols[1].button(label, use_container_width=True, key="_queue_next"):
+    if remaining and cols[1].button("Skip →", use_container_width=True, key="_queue_skip",
+                                     help="Skip this invoice without saving and go to the next"):
         _advance_invoice_queue()
+
+
+def _post_save_actions():
+    """After an invoice is saved: advance the queue (prominent) or finish."""
+    queue = st.session_state.get("_invoice_queue", [])
+    idx = st.session_state.get("_invoice_queue_idx", 0)
+    if len(queue) > 1 and idx + 1 < len(queue):
+        if st.button(f"Next invoice ({idx + 2} of {len(queue)}) →",
+                     type="primary", use_container_width=True, key="_post_next"):
+            _advance_invoice_queue()
+    else:
+        done = len(queue) > 1
+        label = "Finish ✓ — all invoices done" if done else "Process another invoice"
+        if st.button(label, use_container_width=True, key="_post_finish"):
+            st.session_state._invoice_queue = []
+            st.session_state._invoice_queue_idx = 0
+            st.session_state.page = "upload"
+            st.rerun()
 
 
 def save_to_sheets():
@@ -497,9 +515,7 @@ def page_review():
 
     if st.session_state.saved:
         st.success(st.session_state.save_result)
-        if st.button("Process another invoice"):
-            st.session_state.page = "upload"
-            st.rerun()
+        _post_save_actions()
         return
 
     st.caption(
@@ -565,6 +581,7 @@ def page_review():
                 result = save_to_sheets()
             st.session_state.save_result = result
             st.session_state.saved = True
+            st.session_state.page = "results"   # show the invoice total + next-invoice action
             st.rerun()
     with col_skip:
         if st.button("Save only auto-approved", use_container_width=True):
@@ -576,6 +593,7 @@ def page_review():
                 result = save_to_sheets()
             st.session_state.save_result = result
             st.session_state.saved = True
+            st.session_state.page = "results"   # show the invoice total + next-invoice action
             st.rerun()
 
     if pending_count > 0:
@@ -710,6 +728,8 @@ def page_results():
                 st.session_state.save_result = result
                 st.session_state.saved = True
             st.rerun()
+    else:
+        _post_save_actions()
 
 
 # ─────────────────────────────────────────────
