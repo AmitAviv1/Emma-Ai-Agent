@@ -1,9 +1,15 @@
 import os
 import numpy as np
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
-from rembg import remove
 import io
 import re
+
+# rembg (background removal) is heavy and optional — the module must still
+# import (for sanitize_filename / create_formatted_image) even when it's absent.
+try:
+    from rembg import remove
+except Exception:
+    remove = None
 
 def sanitize_filename(filename):
     """
@@ -36,8 +42,11 @@ def process_product_images(input_image_path, product_name, output_directory="pro
         total_px = arr_pre.shape[0] * arr_pre.shape[1]
         already_transparent = np.sum(arr_pre[:, :, 3] == 0) / total_px > 0.10
 
-        if already_transparent:
-            print("🔧 [LOG] Image already has transparent background — skipping rembg...")
+        if already_transparent or remove is None:
+            if remove is None and not already_transparent:
+                print("⚠️ [LOG] rembg not installed — keeping original background.")
+            else:
+                print("🔧 [LOG] Image already has transparent background — skipping rembg...")
             arr = arr_pre
         else:
             print("🔧 [LOG] Removing background...")

@@ -961,9 +961,20 @@ def page_image_processor():
                     )
 
         if st.button(f"Process {len(uploaded_files)} image(s)", type="primary", use_container_width=True):
-            from rembg import remove
+            try:
+                from rembg import remove
+            except Exception:
+                remove = None
             from tools.image_utils.processor import create_formatted_image, sanitize_filename
             import numpy as np
+
+            if remove is None and not skip_rembg:
+                st.warning(
+                    "Background removal isn't available on this server (rembg not installed). "
+                    "Images will be formatted **without** background removal — upload "
+                    "already-transparent PNGs, tick “Background already removed”, or run "
+                    "locally for full background removal."
+                )
 
             output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_images")
             os.makedirs(output_dir, exist_ok=True)
@@ -991,7 +1002,7 @@ def page_image_processor():
                     total_px = arr.shape[0] * arr.shape[1]
                     already_transparent = np.sum(arr[:, :, 3] == 0) / total_px > 0.10
 
-                    if not (skip_rembg or already_transparent):
+                    if not (skip_rembg or already_transparent or remove is None):
                         arr = np.array(Image.open(_io.BytesIO(remove(raw))).convert("RGBA"))
 
                     arr[arr[:, :, 3] < 20, 3] = 0
