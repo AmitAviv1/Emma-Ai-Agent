@@ -346,6 +346,60 @@ INVOICES_SUMMARY_HEADERS = [
 ]
 
 
+def find_existing_invoice(invoice_meta: dict, invoice_total: float):
+    """Check the shared 'Invoices' index for an already-saved invoice matching
+    this one. Returns a dict (invoice_number, invoice_date, processed_at, match)
+    if a duplicate is found, else None.
+
+    Match rule:
+      • If this invoice has a number → same vendor + same invoice_number.
+      • If it has no number → same vendor + same date + same total (weaker).
+    """
+    sheet_id = os.getenv("GOOGLE_SHEET_ID")
+    if not sheet_id:
+        return None
+    try:
+        client = _get_sheet_client()
+        ws = _get_or_create_sheet(client, sheet_id, "Invoices", INVOICES_SUMMARY_HEADERS)
+        rows = ws.get_all_records()
+    except Exception as e:
+        print(f"⚠️  [DUP] Could not read Invoices tab: {e}")
+        return None   # fail open — don't block saving if the check errors
+
+    vendor = (invoice_meta.get("vendor_name") or "").strip()
+    number = (invoice_meta.get("invoice_number") or "").strip()
+    date   = (invoice_meta.get("invoice_date") or "").strip()
+
+    def _num(v):
+        try:
+            return round(float(v), 2)
+        except (TypeError, ValueError):
+            return None
+
+    for r in rows:
+        if str(r.get("vendor_name", "")).strip() != vendor:
+            continue
+        r_number = str(r.get("invoice_number", "")).strip()
+        hit = False
+        match = ""
+        if number and r_number:
+            if r_number == number:
+                hit, match = True, "invoice number"
+        elif not number:
+            same_date  = str(r.get("invoice_date", "")).strip() == date and date != ""
+            same_total = _num(r.get("invoice_total")) is not None and _num(r.get("invoice_total")) == round(invoice_total, 2)
+            if same_date and same_total:
+                hit, match = True, "date + total"
+        if hit:
+            return {
+                "invoice_number": r_number or "(no number)",
+                "invoice_date":   str(r.get("invoice_date", "")),
+                "processed_at":   str(r.get("processed_at", "")),
+                "match":          match,
+            }
+    return None
+
+
 def _write_invoice_summary(client, sheet_id: str, approved: list, invoice_meta: dict):
     """
     Appends one row to the 'Invoices' summary tab — one row per invoice run.

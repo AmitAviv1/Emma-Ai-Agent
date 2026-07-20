@@ -272,6 +272,7 @@ def run_extraction(pdf_path: str):
     st.session_state.pending        = validation["pending_review"]
     st.session_state.saved          = False
     st.session_state.save_result    = ""
+    st.session_state._dup_info      = None
 
     # Initialise decisions keyed by global product index (barcodes can repeat or be empty)
     decisions = {}
@@ -444,6 +445,67 @@ def save_to_sheets():
         return f"❌ Save failed: {e}"
 
 
+def _approved_total() -> float:
+    """Sum of costs for products currently marked 'approve'."""
+    decisions = st.session_state.decisions
+    return sum(
+        p.get("cost", 0)
+        for i, p in enumerate(st.session_state.products)
+        if decisions.get(i, {}).get("decision") == "approve"
+    )
+
+
+def _attempt_save(force: bool = False):
+    """Save to Sheets, but first warn if this invoice looks already-saved.
+    `force=True` skips the duplicate check (used by 'Save anyway')."""
+    if not force:
+        try:
+            from storage import find_existing_invoice
+            meta = {
+                "invoice_number": st.session_state.invoice_number,
+                "invoice_date":   st.session_state.invoice_date or datetime.now().strftime("%Y-%m-%d"),
+                "vendor_name":    st.session_state.vendor_name,
+            }
+            with st.spinner("Checking for duplicates…"):
+                dup = find_existing_invoice(meta, _approved_total())
+        except Exception:
+            dup = None
+        if dup:
+            st.session_state._dup_info = dup
+            st.session_state.page = "results"     # results shows the total + the warning
+            st.rerun()
+            return
+
+    st.session_state._dup_info = None
+    with st.spinner("Saving…"):
+        result = save_to_sheets()
+    st.session_state.save_result = result
+    st.session_state.saved = True
+    st.session_state.page = "results"
+    st.rerun()
+
+
+def _render_dup_warning() -> bool:
+    """If a duplicate was detected, show the warning + confirm/cancel.
+    Returns True if a warning is being shown (caller should hide its save button)."""
+    dup = st.session_state.get("_dup_info")
+    if not dup or st.session_state.saved:
+        return False
+    st.warning(
+        f"⚠️ This looks like a **duplicate**. Invoice **{dup['invoice_number']}** "
+        f"from **{st.session_state.vendor_name}** was already saved"
+        + (f" on {dup['processed_at']}" if dup.get("processed_at") else "")
+        + f" (matched on {dup['match']}). Saving again will double-count it."
+    )
+    c1, c2 = st.columns(2)
+    if c1.button("Save anyway", type="primary", use_container_width=True, key="_dup_force"):
+        _attempt_save(force=True)
+    if c2.button("Cancel", use_container_width=True, key="_dup_cancel"):
+        st.session_state._dup_info = None
+        st.rerun()
+    return True
+
+
 # ─────────────────────────────────────────────
 #  PAGE: UPLOAD
 # ─────────────────────────────────────────────
@@ -577,24 +639,14 @@ def page_review():
     with col_save:
         if st.button("Save all to Google Sheets", type="primary", use_container_width=True,
                      disabled=pending_count > 0):
-            with st.spinner("Saving…"):
-                result = save_to_sheets()
-            st.session_state.save_result = result
-            st.session_state.saved = True
-            st.session_state.page = "results"   # show the invoice total + next-invoice action
-            st.rerun()
+            _attempt_save()
     with col_skip:
         if st.button("Save only auto-approved", use_container_width=True):
             for idx, d in decisions.items():
                 if d.get("decision") == "pending":
                     decisions[idx] = {**d, "decision": "skip"}
             st.session_state.decisions = decisions
-            with st.spinner("Saving…"):
-                result = save_to_sheets()
-            st.session_state.save_result = result
-            st.session_state.saved = True
-            st.session_state.page = "results"   # show the invoice total + next-invoice action
-            st.rerun()
+            _attempt_save()
 
     if pending_count > 0:
         st.caption("⬆ Resolve all pending items before saving, or use 'Save only auto-approved'.")
@@ -719,15 +771,14 @@ def page_results():
 
     st.markdown("---")
     if not st.session_state.saved:
-        if st.button("Save to Google Sheets →", type="primary"):
+        if _render_dup_warning():
+            pass                       # duplicate prompt is showing; hide the save button
+        elif st.button("Save to Google Sheets →", type="primary"):
             if st.session_state.pending:
                 st.session_state.page = "review"
+                st.rerun()
             else:
-                with st.spinner("Saving…"):
-                    result = save_to_sheets()
-                st.session_state.save_result = result
-                st.session_state.saved = True
-            st.rerun()
+                _attempt_save()
     else:
         _post_save_actions()
 
