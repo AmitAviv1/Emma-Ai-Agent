@@ -1614,15 +1614,127 @@ def _extract_product_from_html(html: str, base_url: str = ""):
     return image, (name or "").strip(), (desc or "").strip()
 
 
+PRODEXT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; EmmaAgent/1.0)"}
+PRODEXT_MAX_URLS = 100
+
+
+def _parse_url_list(text: str) -> list:
+    """Pull http(s) URLs out of pasted text, a .txt, or a .csv — in order, deduped.
+
+    Accepts one-per-line, comma-separated, or a CSV where the URL sits in any column.
+    """
+    import re as _re
+    seen, urls = set(), []
+    for m in _re.finditer(r"""https?://[^\s,;"'<>()\[\]]+""", text or ""):
+        u = m.group(0).rstrip(".,;")
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+    return urls
+
+
+def _render_prodext_batch():
+    """Results table for 'URL list' mode: edit names, export CSV, queue images."""
+    import io as _io
+    import pandas as pd
+    import requests
+    from PIL import Image as _PIL
+
+    rows = st.session_state.get("_prodext_batch") or []
+    if not rows:
+        return
+
+    st.markdown("---")
+    ok = sum(1 for r in rows if r["status"] == "ok")
+    st.caption(f"{ok} of {len(rows)} extracted. Untick a row to leave its image out.")
+
+    df = pd.DataFrame([
+        {
+            "Send": bool(r["image_url"]),
+            "Image": r["image_url"],
+            "Name": r["name"],
+            "Description": r["description"],
+            "Status": r["status"],
+            "Source": r["url"],
+        }
+        for r in rows
+    ])
+
+    edited = st.data_editor(
+        df,
+        key="_prodext_batch_editor",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Send": st.column_config.CheckboxColumn("Send", width="small"),
+            "Image": st.column_config.ImageColumn("Image", width="small"),
+            "Name": st.column_config.TextColumn("Name", width="medium"),
+            "Description": st.column_config.TextColumn("Description", width="large"),
+            "Status": st.column_config.TextColumn("Status", width="small"),
+            "Source": st.column_config.LinkColumn("Source", width="small"),
+        },
+        disabled=["Image", "Status", "Source"],
+    )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.download_button(
+            "Download CSV",
+            data=edited.drop(columns=["Send"]).to_csv(index=False).encode("utf-8-sig"),
+            file_name="product_extract.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with col_b:
+        if st.button("Send images to Image Processor →", type="primary", use_container_width=True):
+            picked = edited[edited["Send"] & (edited["Image"].astype(str) != "")]
+            if picked.empty:
+                st.warning("No rows ticked (or no images were found).")
+            else:
+                queue = st.session_state.setdefault("_imgproc_external", [])
+                used = {q["name"] for q in queue}
+                failed = []
+                prog = st.progress(0.0, text="Downloading images…")
+                for i, (_, row) in enumerate(picked.iterrows(), start=1):
+                    prog.progress(i / len(picked), text=f"Downloading {i}/{len(picked)}…")
+                    src = str(row["Image"])
+                    try:
+                        r = requests.get(src, headers=PRODEXT_HEADERS, timeout=15)
+                        r.raise_for_status()
+                        _PIL.open(_io.BytesIO(r.content)).verify()
+                    except Exception as e:
+                        failed.append(f"{row['Name'] or src}: {e}")
+                        continue
+
+                    ext = src.rsplit(".", 1)[-1].lower().split("?")[0]
+                    if ext not in ("jpg", "jpeg", "png", "webp"):
+                        ext = "jpg"
+                    stem = (str(row["Name"]) or "product").strip() or "product"
+                    fname = f"{stem}.{ext}"
+                    n = 2
+                    while fname in used:  # same product name twice would collide in the queue
+                        fname = f"{stem} ({n}).{ext}"
+                        n += 1
+                    used.add(fname)
+                    queue.append({"name": fname, "bytes": r.content})
+                prog.empty()
+
+                if failed:
+                    st.warning("Couldn't download " + f"{len(failed)} image(s):\n\n- " + "\n- ".join(failed[:10]))
+                if len(failed) < len(picked):
+                    st.session_state.page = "image_processor"
+                    st.rerun()
+
+
 def page_product_extract():
     import requests
 
     st.title("Product Page Extractor")
-    st.caption("Paste a product URL, drop an .html file, or paste HTML — pull out the image, name and description.")
+    st.caption("Paste a product URL or a whole list, drop an .html file, or paste HTML — pull out the image, name and description.")
 
     mode = st.radio(
         "Source",
-        ["URL", "Search", "HTML file", "Paste HTML"],
+        ["URL", "URL list", "Search", "HTML file", "Paste HTML"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -1662,6 +1774,70 @@ def page_product_extract():
                 base_url = url
             except Exception as e:
                 st.error(f"Fetch failed: {e}")
+
+    elif mode == "URL list":
+        import time as _time
+
+        st.caption(
+            f"One URL per line (or comma-separated). Up to {PRODEXT_MAX_URLS} per run."
+        )
+
+        listed = st.file_uploader(
+            "Or load them from a .txt / .csv",
+            type=["txt", "csv"],
+            key="_prodext_urlfile",
+        )
+        if listed is not None:
+            stamp = f"{listed.name}:{listed.size}"
+            if st.session_state.get("_prodext_urlfile_stamp") != stamp:
+                st.session_state["_prodext_urlfile_stamp"] = stamp
+                found = _parse_url_list(listed.getvalue().decode("utf-8", errors="replace"))
+                st.session_state["_prodext_urls"] = "\n".join(found)
+                st.toast(f"Loaded {len(found)} URL(s) from {listed.name}")
+
+        raw = st.text_area(
+            "Product URLs",
+            height=180,
+            key="_prodext_urls",
+            placeholder="https://dudi-agencies.co.il/product/…\nhttps://dudi-agencies.co.il/product/…",
+            label_visibility="collapsed",
+        )
+        urls = _parse_url_list(raw)
+        if urls:
+            note = f"{len(urls)} unique URL(s) detected."
+            if len(urls) > PRODEXT_MAX_URLS:
+                note += f" Only the first {PRODEXT_MAX_URLS} will be fetched."
+            st.caption(note)
+
+        delay = st.slider(
+            "Pause between requests (seconds)", 0.0, 3.0, 0.5, 0.5,
+            help="Pages are fetched one at a time. A small pause keeps supplier sites from blocking you.",
+        )
+
+        if st.button(
+            "Fetch & extract all", type="primary", use_container_width=True, disabled=not urls
+        ):
+            batch = urls[:PRODEXT_MAX_URLS]
+            rows = []
+            prog = st.progress(0.0, text="Starting…")
+            for i, u in enumerate(batch, start=1):
+                prog.progress(i / len(batch), text=f"{i}/{len(batch)} — {u[:70]}")
+                row = {"url": u, "image_url": "", "name": "", "description": "", "status": ""}
+                try:
+                    resp = requests.get(u, headers=PRODEXT_HEADERS, timeout=15)
+                    resp.raise_for_status()
+                    image_url, name, desc = _extract_product_from_html(resp.text, base_url=u)
+                    row["image_url"], row["name"], row["description"] = image_url, name, desc
+                    row["status"] = "ok" if (image_url or name) else "nothing found"
+                except Exception as e:
+                    row["status"] = f"failed: {e}"
+                rows.append(row)
+                if delay and i < len(batch):
+                    _time.sleep(delay)
+            prog.empty()
+            st.session_state["_prodext_batch"] = rows
+            # A fresh run invalidates any edits held by the results editor
+            st.session_state.pop("_prodext_batch_editor", None)
 
     elif mode == "Search":
         from urllib.parse import urljoin, urlencode
@@ -1790,6 +1966,10 @@ def page_product_extract():
         # Sync editable fields to the new extraction (passing value= alongside key= would be ignored on rerun)
         st.session_state["_prodext_name"] = name
         st.session_state["_prodext_desc"] = desc
+
+    if mode == "URL list":
+        _render_prodext_batch()
+        return
 
     result = st.session_state.get("_prodext_result")
     if result:
